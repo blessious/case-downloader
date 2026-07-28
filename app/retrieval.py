@@ -34,7 +34,13 @@ MONTH_CODES = {
     11: "nov",
     12: "dec",
 }
-ALLOWED_HOSTS = {"lawphil.net", "www.lawphil.net", "elibrary.judiciary.gov.ph"}
+ALLOWED_HOSTS = {
+    "lawphil.net",
+    "www.lawphil.net",
+    "elibrary.judiciary.gov.ph",
+    "chanrobles.com",
+    "www.chanrobles.com",
+}
 ELIBRARY_SEARCH_URL = (
     "https://elibrary.judiciary.gov.ph/assets/dtSearch/"
     "dtSearch_system_files/dtisapi6.dll"
@@ -235,6 +241,74 @@ class CaseRetriever:
             raise RuntimeError(
                 "PDF browser engine is unavailable. Run the app setup to install Chromium."
             ) from exc
+
+    async def _browser_html(self, source: str, url: str) -> tuple[str, str]:
+        _assert_allowed(url)
+        started = utc_now()
+        context = None
+        page = None
+        try:
+            await asyncio.sleep(REQUEST_DELAY_SECONDS)
+            browser = await self._ensure_browser()
+            context = await browser.new_context()
+            page = await context.new_page()
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=90_000
+            )
+            if not response or response.status >= 400:
+                status = response.status if response else "no response"
+                raise RuntimeError(f"Could not load source page ({status})")
+            content = await page.content()
+            if _looks_blocked(content):
+                raise PermissionError(
+                    "Website presented a CAPTCHA, login, or access-block page"
+                )
+            final_url = page.url
+            _assert_allowed(final_url)
+            self.attempts.append(
+                RetrievalAttempt(
+                    source,
+                    final_url,
+                    1,
+                    "Success",
+                    started_at=started,
+                    finished_at=utc_now(),
+                )
+            )
+            return content, final_url
+        except Exception as exc:
+            code = "ACCESS_BLOCKED" if isinstance(exc, PermissionError) else "BROWSER_LOAD_FAILED"
+            self.attempts.append(
+                RetrievalAttempt(
+                    source,
+                    url,
+                    1,
+                    "Failed",
+                    code,
+                    str(exc),
+                    started,
+                    utc_now(),
+                )
+            )
+            raise
+        finally:
+            if page:
+                await page.close()
+            if context:
+                await context.close()
+
+    async def _html_with_browser_fallback(
+        self, source: str, url: str
+    ) -> tuple[str, str]:
+        try:
+            response = await self._request(source, "GET", url)
+            return response.text, str(response.url)
+        except PermissionError:
+            return await self._browser_html(source, url)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 403:
+                raise
+            return await self._browser_html(source, url)
 
     async def _render_pdf(self, source: str, url: str, output_path: Path) -> None:
         _assert_allowed(url)
@@ -518,6 +592,81 @@ class CaseRetriever:
             return True, used_url, warnings, "", ""
         return False, page_url, warnings, "PDF_CREATION_FAILED", "E-Library document could not be saved as a valid PDF"
 
+    async def _chanrobles(
+        self, case: ParsedCase, output_path: Path
+    ) -> tuple[bool, str, list[str], str, str]:
+        try:
+            parsed_date = datetime.fromisoformat(case.decision_date)
+        except ValueError:
+            return False, "", [], "INVALID_DATE", "Decision date is invalid"
+        index_url = (
+            f"https://chanrobles.com/cralaw/{parsed_date.year}decisions.php"
+            f"?id={parsed_date.month}"
+        )
+        try:
+            index_html, resolved_index_url = await self._html_with_browser_fallback(
+                "ChanRobles", index_url
+            )
+        except PermissionError as exc:
+            return False, index_url, [], "ACCESS_BLOCKED", str(exc)
+        except Exception as exc:
+            return False, index_url, [], "CHANROBLES_INDEX_ERROR", str(exc)
+
+        tokens = docket_tokens(case.docket)
+        if not tokens:
+            return False, index_url, [], "INVALID_DOCKET", "No docket number could be parsed"
+        primary = tokens[0]
+        soup = BeautifulSoup(index_html, "html.parser")
+        candidates: list[str] = []
+        for anchor in soup.find_all("a", href=True):
+            if primary not in re.sub(r"\D", "", anchor.get_text(" ", strip=True)):
+                continue
+            url = _normalize_url(str(anchor["href"]), resolved_index_url)
+            if urlparse(url).hostname in ALLOWED_HOSTS:
+                candidates.append(url)
+        candidates = list(dict.fromkeys(candidates))
+        if not candidates:
+            return False, index_url, [], "NOT_FOUND", "No matching ChanRobles case was found"
+        if len(candidates) > 1:
+            return (
+                False,
+                index_url,
+                [],
+                "AMBIGUOUS_MATCH",
+                f"ChanRobles returned {len(candidates)} matching decision links",
+            )
+
+        page_url = candidates[0]
+        try:
+            page_html, resolved_page_url = await self._html_with_browser_fallback(
+                "ChanRobles", page_url
+            )
+        except Exception as exc:
+            return False, page_url, [], "CHANROBLES_PAGE_ERROR", str(exc)
+        page_text = BeautifulSoup(page_html, "html.parser").get_text(" ", strip=True)
+        if primary not in re.sub(r"\D", "", page_text[:10_000]) or not _date_matches(
+            page_text[:10_000], case.decision_date
+        ):
+            return (
+                False,
+                page_url,
+                [],
+                "IDENTITY_MISMATCH",
+                "ChanRobles page did not match the expected docket number and date",
+            )
+        success, used_url, warnings = await self._download_or_render(
+            case, "ChanRobles", resolved_page_url, page_html, output_path
+        )
+        if success:
+            return True, used_url, warnings, "", ""
+        return (
+            False,
+            page_url,
+            warnings,
+            "PDF_CREATION_FAILED",
+            "ChanRobles document could not be saved as a valid PDF",
+        )
+
     async def retrieve(
         self,
         case: ParsedCase,
@@ -549,15 +698,28 @@ class CaseRetriever:
                 warnings=lawphil[2] + elibrary[2],
             )
         output_path.unlink(missing_ok=True)
-        error_code = elibrary[3] or lawphil[3] or "NOT_FOUND"
+        await status_callback("Searching ChanRobles")
+        chanrobles = await self._chanrobles(case, output_path)
+        if chanrobles[0]:
+            return RetrievalResult(
+                True,
+                "ChanRobles",
+                chanrobles[1],
+                str(output_path),
+                attempts=list(self.attempts),
+                warnings=lawphil[2] + elibrary[2] + chanrobles[2],
+            )
+        output_path.unlink(missing_ok=True)
+        error_code = chanrobles[3] or elibrary[3] or lawphil[3] or "NOT_FOUND"
         error_message = (
             f"Lawphil: {lawphil[4] or 'not saved'}; "
-            f"E-Library: {elibrary[4] or 'not saved'}"
+            f"E-Library: {elibrary[4] or 'not saved'}; "
+            f"ChanRobles: {chanrobles[4] or 'not saved'}"
         )
         return RetrievalResult(
             False,
             error_code=error_code,
             error_message=error_message,
             attempts=list(self.attempts),
-            warnings=lawphil[2] + elibrary[2],
+            warnings=lawphil[2] + elibrary[2] + chanrobles[2],
         )

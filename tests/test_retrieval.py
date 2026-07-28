@@ -133,6 +133,90 @@ async def test_elibrary_fallback_is_used_when_lawphil_missing(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_chanrobles_fallback_is_used_when_other_sources_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf = blank_pdf()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "lawphil.net" in url:
+            return httpx.Response(404, request=request)
+        if "elibrary.judiciary.gov.ph" in url:
+            return httpx.Response(200, text="<html></html>", request=request)
+        if url.endswith("2005decisions.php?id=6"):
+            return httpx.Response(
+                200,
+                text=(
+                    '<a href="2005junedecisions.php?id=596">'
+                    "G.R. No. 145561 - Honda Philippines</a>"
+                ),
+                request=request,
+            )
+        if url.endswith("2005junedecisions.php?id=596"):
+            return httpx.Response(
+                200,
+                text="<html><body>G.R. No. 145561 : June 15, 2005</body></html>",
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+    case = ParsedCase(
+        1,
+        "Week 2",
+        "Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda",
+        "G.R. No. 145561",
+        "2005-06-15",
+        "",
+    )
+    statuses: list[str] = []
+
+    async def status(value: str) -> None:
+        statuses.append(value)
+
+    async def render_pdf(_source: str, _url: str, output_path: Path) -> None:
+        output_path.write_bytes(pdf)
+
+    async with CaseRetriever(client) as retriever:
+        monkeypatch.setattr(retriever, "_render_pdf", render_pdf)
+        result = await retriever.retrieve(case, tmp_path / "case.part", status)
+    await client.aclose()
+    assert result.success
+    assert result.source == "ChanRobles"
+    assert result.source_url.endswith("2005junedecisions.php?id=596")
+    assert statuses == [
+        "Searching Lawphil",
+        "Searching E-Library",
+        "Searching ChanRobles",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_browser_is_used_when_chanrobles_rejects_plain_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="Forbidden", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+    browser_calls: list[str] = []
+
+    async def browser_html(_source: str, url: str) -> tuple[str, str]:
+        browser_calls.append(url)
+        return "<html>Browser response</html>", url
+
+    async with CaseRetriever(client) as retriever:
+        monkeypatch.setattr(retriever, "_browser_html", browser_html)
+        content, url = await retriever._html_with_browser_fallback(
+            "ChanRobles", "https://chanrobles.com/cralaw/2005decisions.php?id=6"
+        )
+    await client.aclose()
+    assert content == "<html>Browser response</html>"
+    assert url == browser_calls[0]
+
+
+@pytest.mark.asyncio
 async def test_lawphil_render_removes_cookie_notice(tmp_path: Path) -> None:
     case = ParsedCase(
         1,

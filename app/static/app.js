@@ -13,6 +13,35 @@ const state = {
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
+function showWorkflowStep(step) {
+  const sections = {
+    input: "#setup-section",
+    review: "#review-section",
+    download: "#run-section",
+    history: "#history-section",
+  };
+  Object.values(sections).forEach((selector) => {
+    $(selector).classList.add("hidden");
+  });
+  $(sections[step]).classList.remove("hidden");
+  $$(".workflow-step").forEach((button) => {
+    button.classList.toggle(
+      "active",
+      button.id === (step === "history" ? "history-button" : `workflow-${step}`),
+    );
+  });
+  $(sections[step]).scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function updateQueueCount() {
+  const count = state.cases.length;
+  $("#queue-count").textContent = count
+    ? `${count} ${count === 1 ? "case" : "cases"} in queue`
+    : "No cases loaded";
+  $("#workflow-review").disabled = count === 0;
+  $("#workflow-download").disabled = !state.currentRunId;
+}
+
 function showAlert(message, success = false) {
   const alert = $("#alert");
   alert.textContent = message;
@@ -181,8 +210,8 @@ function showReview(data, source) {
   state.folderValid = false;
   $("#folder-message").textContent = "";
   renderReview();
-  $("#review-section").classList.remove("hidden");
-  $("#review-section").scrollIntoView({ behavior: "smooth", block: "start" });
+  updateQueueCount();
+  showWorkflowStep("review");
   window.setTimeout(() => validateFolder(false), 0);
 }
 
@@ -283,11 +312,11 @@ async function startRun() {
       }),
     });
     state.currentRunId = result.run_id;
-    $("#run-section").classList.remove("hidden");
+    updateQueueCount();
     $("#cancel-button").classList.remove("hidden");
     $("#retry-button").classList.add("hidden");
     $("#report-button").classList.add("hidden");
-    $("#run-section").scrollIntoView({ behavior: "smooth", block: "start" });
+    showWorkflowStep("download");
     beginPolling();
   } catch (error) {
     showAlert(error.message);
@@ -302,6 +331,7 @@ const activeCaseStatuses = new Set([
   "Queued",
   "Searching Lawphil",
   "Searching E-Library",
+  "Searching ChanRobles",
   "Saving",
 ]);
 
@@ -359,7 +389,7 @@ function renderRun(run) {
     : "Downloading cases";
   $("#run-subtitle").textContent = terminal
     ? `${counts.saved + counts.existing} of ${counts.total} cases are available in the destination folder.`
-    : "Checking Lawphil first, then the Supreme Court E-Library.";
+    : "Checking Lawphil, the Supreme Court E-Library, then ChanRobles.";
   $("#cancel-button").classList.toggle("hidden", terminal);
   $("#retry-button").classList.toggle("hidden", !terminal || counts.failed === 0);
   const hasXlsx = run.report_path && !run.report_path.includes(";");
@@ -495,17 +525,15 @@ async function openHistory() {
       open.addEventListener("click", async () => {
         state.currentRunId = run.id;
         const detail = await api(`/api/runs/${run.id}`);
-        $("#run-section").classList.remove("hidden");
+        updateQueueCount();
         renderRun(detail);
-        $("#history-section").classList.add("hidden");
-        $("#run-section").scrollIntoView({ behavior: "smooth" });
+        showWorkflowStep("download");
         if (!terminalStatuses.has(detail.status)) beginPolling();
       });
       item.append(summary, counts, open);
       list.appendChild(item);
     });
-    $("#history-section").classList.remove("hidden");
-    $("#history-section").scrollIntoView({ behavior: "smooth", block: "start" });
+    showWorkflowStep("history");
   } catch (error) {
     showAlert(error.message);
   }
@@ -539,14 +567,16 @@ $("#output-dir").addEventListener("input", () => {
 });
 $("#start-button").addEventListener("click", startRun);
 $("#back-button").addEventListener("click", () => {
-  $("#review-section").classList.add("hidden");
-  $("#setup-section").scrollIntoView({ behavior: "smooth" });
+  showWorkflowStep("input");
 });
 $("#cancel-button").addEventListener("click", cancelRun);
 $("#retry-button").addEventListener("click", retryRun);
+$("#workflow-input").addEventListener("click", () => showWorkflowStep("input"));
+$("#workflow-review").addEventListener("click", () => showWorkflowStep("review"));
+$("#workflow-download").addEventListener("click", () => showWorkflowStep("download"));
 $("#history-button").addEventListener("click", openHistory);
 $("#close-history-button").addEventListener("click", () => {
-  $("#history-section").classList.add("hidden");
+  showWorkflowStep(state.currentRunId ? "download" : state.cases.length ? "review" : "input");
 });
 $$(".filter").forEach((button) => {
   button.addEventListener("click", () => {
@@ -557,4 +587,5 @@ $$(".filter").forEach((button) => {
   });
 });
 
+updateQueueCount();
 initialize();

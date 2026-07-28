@@ -1,6 +1,6 @@
 # Case PDF Downloader
 
-A local, cross-platform web application that turns assigned Philippine case lists into organized full-text PDFs. It checks Lawphil first, uses the Supreme Court E-Library as a fallback, validates every PDF, and records every case that was not saved.
+A local, cross-platform web application that turns assigned Philippine case lists into organized full-text PDFs. It checks Lawphil first, then the Supreme Court E-Library and ChanRobles as fallbacks, validates every PDF, and records every case that was not saved.
 
 ## Features
 
@@ -55,4 +55,4 @@ Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda.pdf
 
 ## Privacy and website access
 
-Run history stays in the current user’s application-data directory. Only Lawphil and the Supreme Court E-Library are contacted. Requests are rate-limited, and the application does not bypass CAPTCHA, login, or access controls.
+Run history stays in the current user’s application-data directory. Only Lawphil, the Supreme Court E-Library, and ChanRobles are contacted. Requests are rate-limited, and the application does not bypass CAPTCHA, login, or access controls.

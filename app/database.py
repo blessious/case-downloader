@@ -94,7 +94,13 @@ class Database:
                 UPDATE cases SET status='Not saved', updated_at=?,
                     error_code='INTERRUPTED',
                     error_message='Application closed before this case completed'
-                WHERE status IN ('Queued', 'Searching Lawphil', 'Searching E-Library', 'Saving')
+                WHERE status IN (
+                    'Queued',
+                    'Searching Lawphil',
+                    'Searching E-Library',
+                    'Searching ChanRobles',
+                    'Saving'
+                )
                 """,
                 (now,),
             )

@@ -334,6 +334,7 @@ class JobManager:
                         "Queued",
                         "Searching Lawphil",
                         "Searching E-Library",
+                        "Searching ChanRobles",
                         "Saving",
                     ):
                         self.database.update_case(
