@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="A personal tool for downloading full-text Philippine cases."
+    />
+    <title>Case Downloader</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="Case Downloader home">
+          <span class="brand-mark">C</span>
+          <span>
+            <strong>Case Downloader</strong>
+            <small>Personal tool</small>
+          </span>
+        </a>
+        <button class="button quiet compact" id="history-button" type="button">
+          History
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <div class="page-intro">
+        <div>
+          <h1>Download case PDFs</h1>
+          <p>Paste your assigned cases or upload a Word file.</p>
+        </div>
+        <p class="source-note">Lawphil first, E-Library if unavailable</p>
+      </div>
+
+      <div id="alert" class="alert hidden" role="alert"></div>
+
+      <section class="panel" id="setup-section">
+        <div class="panel-header">
+          <div>
+            <h2>Add cases</h2>
+            <p>Keep the case titles as you want them to appear in the filenames.</p>
+          </div>
+        </div>
+
+        <div class="input-tabs" role="tablist">
+          <button class="tab active" id="paste-tab" type="button" role="tab">
+            Paste list
+          </button>
+          <button class="tab" id="docx-tab" type="button" role="tab">
+            Upload Word file
+          </button>
+        </div>
+
+        <div id="paste-panel" class="input-panel">
+          <label for="case-text">Case list</label>
+          <textarea
+            id="case-text"
+            rows="8"
+            placeholder="WEEK 2&#10;1. Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda, G.R. No. 145561, June 15, 2005&#10;2. Another Case v. Respondent, G.R. No. 123456, January 1, 2020"
+          ></textarea>
+          <div class="field-footer">
+            <span>Numbered lists and week headings are supported.</span>
+            <button class="button primary" id="parse-text-button" type="button">
+              Continue
+            </button>
+          </div>
+        </div>
+
+        <div id="docx-panel" class="input-panel hidden">
+          <label class="drop-zone" for="docx-file">
+            <span class="upload-symbol">W</span>
+            <strong>Choose a .docx file</strong>
+            <span>Maximum file size: 15 MB</span>
+            <input id="docx-file" type="file" accept=".docx" />
+          </label>
+          <div class="field-footer">
+            <span id="docx-name">No file selected</span>
+            <button class="button primary" id="parse-docx-button" type="button" disabled>
+              Continue
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="review-section">
+        <div class="panel-header">
+          <div>
+            <h2>Check cases</h2>
+            <p>Fix any highlighted information before downloading.</p>
+          </div>
+          <div class="review-counts">
+            <span id="case-count">0 cases</span>
+            <span class="danger-text" id="parse-error-count"></span>
+          </div>
+        </div>
+
+        <div class="table-wrap review-table-wrap">
+          <table class="data-table review-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Week</th>
+                <th>Case title / filename</th>
+                <th>G.R. number</th>
+                <th>Date</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="review-body"></tbody>
+          </table>
+        </div>
+
+        <div class="destination-block">
+          <div class="destination-copy">
+            <label for="output-dir">Save PDFs to</label>
+            <small>Enter a full Windows or macOS folder path.</small>
+          </div>
+          <div class="path-control">
+            <input id="output-dir" type="text" spellcheck="false" />
+            <button class="button secondary" id="validate-folder-button" type="button">
+              Check
+            </button>
+          </div>
+          <p class="folder-message" id="folder-message"></p>
+        </div>
+
+        <div class="review-actions">
+          <button class="button quiet" id="back-button" type="button">Back</button>
+          <div>
+            <span class="save-rule">Existing PDFs are not overwritten.</span>
+            <button class="button primary" id="start-button" type="button">
+              Find and save PDFs
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="run-section">
+        <div class="run-heading">
+          <div>
+            <h2 id="run-title">Downloading cases</h2>
+            <p id="run-subtitle">Checking Lawphil first, then the E-Library.</p>
+          </div>
+          <div class="run-actions">
+            <button class="button danger hidden" id="cancel-button" type="button">
+              Cancel
+            </button>
+            <button class="button secondary hidden" id="retry-button" type="button">
+              Retry not saved
+            </button>
+            <a class="button primary hidden" id="report-button" href="#">Download report</a>
+          </div>
+        </div>
+
+        <div class="progress-track"><div id="progress-bar"></div></div>
+
+        <div class="stat-grid">
+          <div class="stat"><strong id="stat-total">0</strong><span>Total</span></div>
+          <div class="stat success"><strong id="stat-saved">0</strong><span>Saved</span></div>
+          <div class="stat neutral">
+            <strong id="stat-existing">0</strong><span>Already there</span>
+          </div>
+          <div class="stat failure"><strong id="stat-failed">0</strong><span>Not saved</span></div>
+        </div>
+
+        <div class="results-toolbar">
+          <div class="filter-group" role="group" aria-label="Filter results">
+            <button class="filter active" data-filter="all" type="button">All</button>
+            <button class="filter" data-filter="active" type="button">Working</button>
+            <button class="filter" data-filter="saved" type="button">Saved</button>
+            <button class="filter" data-filter="failed" type="button">Not saved</button>
+          </div>
+          <span id="last-updated"></span>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table result-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Case</th>
+                <th>Week</th>
+                <th>Status</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+
+        <div class="not-saved-panel hidden" id="not-saved-panel">
+          Unsuccessful cases are listed above and in the report's <strong>Not Saved</strong>
+          sheet.
+        </div>
+      </section>
+
+      <section class="panel history-panel hidden" id="history-section">
+        <div class="history-header">
+          <div>
+            <h2>Previous runs</h2>
+            <p>Stored only on this computer.</p>
+          </div>
+          <button class="button quiet compact" id="close-history-button" type="button">
+            Close
+          </button>
+        </div>
+        <div id="history-list" class="history-list"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Case Downloader <b id="app-version"></b></span>
+      <span>Local only</span>
+    </footer>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

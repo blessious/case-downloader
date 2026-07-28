@@ -1,0 +1,49 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build and package output
+build/
+dist/
+dist-*/
+*.spec.bak
+
+# Test and browser output
+test-results/
+playwright-report/
+
+# Downloaded cases and generated reports
+*.part
+*.pdf
+case-download-report_*.xlsx
+case-download-report_*.csv
+case-download-report_*.json
+Case PDFs/
+downloads/
+
+# Local application data
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
