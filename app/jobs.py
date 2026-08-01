@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import tempfile
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .config import DOWNLOAD_CONCURRENCY
 from .database import Database
 from .domain import ParsedCase
 from .filenames import filename_for_title, path_too_long, safe_week_folder
 from .pdf_utils import validate_pdf
-from .reporting import create_fallback_reports, create_xlsx_report
 from .retrieval import CaseRetriever
+from .resolver import (
+    CaseCandidate,
+    CaseResolver,
+    GoogleSearchBlocked,
+    WebSearchError,
+    candidate_is_high_confidence,
+    candidates_are_ambiguous,
+    google_search_url,
+)
 
 
 class FolderValidationError(ValueError):
@@ -120,6 +126,31 @@ class JobManager:
         self.database.update_run(run_id, status="Cancelling")
         return True
 
+    def select_candidate(self, run_id: str, case_id: str, candidate_id: str) -> bool:
+        existing = self.tasks.get(run_id)
+        if existing and not existing.done():
+            return False
+        candidate = self.database.get_case_candidate(case_id, candidate_id)
+        item = self.database.get_case(run_id, case_id)
+        if not candidate or not item:
+            return False
+        self.database.update_case(
+            case_id,
+            status="Queued",
+            docket=candidate["docket"],
+            decision_date=candidate["decision_date"],
+            reporter_citation=candidate["reporter_citation"],
+            metadata_source=candidate["source"],
+            metadata_source_url=candidate["source_url"],
+            error_code="",
+            error_message="",
+            manual_search_url="",
+        )
+        self.database.clear_case_candidates(case_id)
+        task = asyncio.create_task(self._process_selected_case(run_id, case_id))
+        self.tasks[run_id] = task
+        return True
+
     async def _record_attempts(self, run_id: str, case_id: str, result: Any) -> None:
         for attempt in result.attempts:
             self.database.add_attempt(
@@ -141,8 +172,122 @@ class JobManager:
         item: dict[str, Any],
         output_dir: Path,
         retriever: CaseRetriever,
+        resolver: CaseResolver,
     ) -> None:
         case_id = item["id"]
+        selected_candidate: CaseCandidate | None = None
+        if (
+            not item.get("docket") or not item.get("decision_date")
+        ) and not item.get("metadata_source_url"):
+            self.database.update_case(case_id, status="Searching case details")
+            lookup_case = ParsedCase(
+                ordinal=item["ordinal"],
+                week=item["week"],
+                title=item["title"],
+                docket=item.get("docket", ""),
+                decision_date=item.get("decision_date", ""),
+                raw_text=item.get("raw_text", ""),
+                reporter_citation=item.get("reporter_citation", ""),
+            )
+            try:
+                self.database.update_case(case_id, status="Searching Google")
+                page_fetcher = getattr(retriever, "fetch_text", None)
+                try:
+                    candidates = await resolver.candidates(lookup_case, page_fetcher)
+                except TypeError:
+                    candidates = await resolver.candidates(lookup_case)
+            except GoogleSearchBlocked as exc:
+                if exc.candidates:
+                    self.database.set_case_candidates(
+                        case_id, [candidate.as_dict() for candidate in exc.candidates[:5]]
+                    )
+                self.database.update_case(
+                    case_id,
+                    status="Needs review",
+                    error_code="GOOGLE_SEARCH_BLOCKED",
+                    error_message=str(exc),
+                    manual_search_url=exc.manual_search_url,
+                )
+                return
+            except WebSearchError as exc:
+                self.database.update_case(
+                    case_id,
+                    status="Needs review",
+                    error_code="GOOGLE_SEARCH_FAILED",
+                    error_message="Google search could not be completed. Retry later or search manually.",
+                    manual_search_url=google_search_url(item.get("raw_text") or item["title"]),
+                )
+                return
+            except Exception as exc:
+                self.database.update_case(
+                    case_id,
+                    status="Not saved",
+                    error_code="METADATA_LOOKUP_FAILED",
+                    error_message=f"Could not search the case title: {exc}",
+                )
+                return
+            if not candidates:
+                self.database.update_case(
+                    case_id,
+                    status="Not saved",
+                    error_code="CASE_NOT_FOUND",
+                    error_message="No matching decision was found from the syllabus entry",
+                    manual_search_url="",
+                )
+                return
+            if candidates[0].score == 0:
+                candidates[0].score = 100
+                candidates[0].verified = True
+                candidates[0].reasons = ["Both case sides matched"]
+            if candidates_are_ambiguous(candidates) or not candidate_is_high_confidence(
+                candidates[0]
+            ):
+                self.database.set_case_candidates(
+                    case_id, [candidate.as_dict() for candidate in candidates[:5]]
+                )
+                self.database.update_case(
+                    case_id,
+                    status="Needs review",
+                    error_code="MATCH_REVIEW_REQUIRED",
+                    error_message="Choose a match, or open Google if none is correct",
+                    manual_search_url=google_search_url(
+                        item.get("raw_text") or item["title"]
+                    ),
+                )
+                return
+            candidate = candidates[0]
+            selected_candidate = candidate
+            self.database.update_case(case_id, status="Verifying match")
+            item["docket"] = item.get("docket") or candidate.docket
+            item["decision_date"] = item.get("decision_date") or candidate.decision_date
+            item["reporter_citation"] = (
+                item.get("reporter_citation") or candidate.reporter_citation
+            )
+            item["metadata_source"] = candidate.source
+            item["metadata_source_url"] = candidate.source_url
+            if len(candidates) > 1:
+                item["warnings"] = list(item.get("warnings", [])) + [
+                    f"Title search returned {len(candidates)} matches; the closest result was used"
+                ]
+            if not item["docket"] or not item["decision_date"]:
+                self.database.update_case(
+                    case_id,
+                    status="Not saved",
+                    error_code="INCOMPLETE_MATCH",
+                    error_message="The matching decision did not include enough download details",
+                )
+                return
+            self.database.update_case(
+                case_id,
+                docket=item["docket"],
+                decision_date=item["decision_date"],
+                reporter_citation=item["reporter_citation"],
+                metadata_source=item["metadata_source"],
+                metadata_source_url=item["metadata_source_url"],
+                manual_search_url="",
+                warnings=item.get("warnings", []),
+            )
+            self.database.clear_case_candidates(case_id)
         week_dir = output_dir / safe_week_folder(item["week"])
         try:
             week_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +339,9 @@ class JobManager:
             decision_date=item["decision_date"],
             raw_text=item["raw_text"],
             warnings=list(item.get("warnings", [])),
+            reporter_citation=item.get("reporter_citation", ""),
+            metadata_source=item.get("metadata_source", ""),
+            metadata_source_url=item.get("metadata_source_url", ""),
         )
 
         async def update_status(status: str) -> None:
@@ -202,6 +350,94 @@ class JobManager:
         try:
             result = await retriever.retrieve(parsed, part_path, update_status)
             await self._record_attempts(run_id, case_id, result)
+            if not result.success and not item.get("metadata_source_url"):
+                # A complete docket/date can still miss brittle source indexes.
+                # Only then broaden the lookup through Google, like a manual retry.
+                try:
+                    self.database.update_case(case_id, status="Searching Google")
+                    page_fetcher = getattr(retriever, "fetch_text", None)
+                    try:
+                        fallback_candidates = await resolver.candidates(parsed, page_fetcher)
+                    except TypeError:
+                        fallback_candidates = await resolver.candidates(parsed)
+                except GoogleSearchBlocked as exc:
+                    if exc.candidates:
+                        self.database.set_case_candidates(
+                            case_id,
+                            [candidate.as_dict() for candidate in exc.candidates[:5]],
+                        )
+                    self.database.update_case(
+                        case_id,
+                        status="Needs review",
+                        error_code="GOOGLE_SEARCH_BLOCKED",
+                        error_message=str(exc),
+                        manual_search_url=exc.manual_search_url,
+                    )
+                    return
+                except WebSearchError:
+                    self.database.update_case(
+                        case_id,
+                        status="Needs review",
+                        error_code="GOOGLE_SEARCH_FAILED",
+                        error_message=(
+                            "Google search could not be completed. "
+                            "Retry later or search manually."
+                        ),
+                        manual_search_url=google_search_url(
+                            item.get("raw_text") or item["title"]
+                        ),
+                    )
+                    return
+                except Exception:
+                    fallback_candidates = []
+
+                if fallback_candidates:
+                    if fallback_candidates[0].score == 0:
+                        fallback_candidates[0].score = 100
+                        fallback_candidates[0].verified = True
+                        fallback_candidates[0].reasons = ["Both case sides matched"]
+                    if candidates_are_ambiguous(
+                        fallback_candidates
+                    ) or not candidate_is_high_confidence(fallback_candidates[0]):
+                        self.database.set_case_candidates(
+                            case_id,
+                            [candidate.as_dict() for candidate in fallback_candidates[:5]],
+                        )
+                        self.database.update_case(
+                            case_id,
+                            status="Needs review",
+                            error_code="MATCH_REVIEW_REQUIRED",
+                            error_message="Choose a match, or open Google if none is correct",
+                            manual_search_url=google_search_url(
+                                item.get("raw_text") or item["title"]
+                            ),
+                        )
+                        return
+                    fallback_candidate = fallback_candidates[0]
+                    selected_candidate = fallback_candidate
+                    item["metadata_source"] = fallback_candidate.source
+                    item["metadata_source_url"] = fallback_candidate.source_url
+                    self.database.update_case(
+                        case_id,
+                        status="Verifying match",
+                        metadata_source=fallback_candidate.source,
+                        metadata_source_url=fallback_candidate.source_url,
+                        manual_search_url="",
+                    )
+                    retry_case = ParsedCase(
+                        ordinal=parsed.ordinal,
+                        week=parsed.week,
+                        title=parsed.title,
+                        docket=parsed.docket,
+                        decision_date=parsed.decision_date,
+                        raw_text=parsed.raw_text,
+                        warnings=parsed.warnings,
+                        reporter_citation=parsed.reporter_citation,
+                        metadata_source=fallback_candidate.source,
+                        metadata_source_url=fallback_candidate.source_url,
+                    )
+                    result = await retriever.retrieve(retry_case, part_path, update_status)
+                    await self._record_attempts(run_id, case_id, result)
             warnings = list(item.get("warnings", [])) + result.warnings
             if not result.success:
                 self.database.update_case(
@@ -237,6 +473,20 @@ class JobManager:
                 source_url=result.source_url,
                 warnings=warnings + validation.warnings,
             )
+            cache_candidate = selected_candidate or CaseCandidate(
+                title=item["title"],
+                docket=item.get("docket", ""),
+                decision_date=item.get("decision_date", ""),
+                reporter_citation=item.get("reporter_citation", ""),
+                source=result.source,
+                source_url=result.source_url,
+                score=100,
+                reasons=["Successfully downloaded and verified"],
+                verified=True,
+            )
+            cache_verified = getattr(resolver, "cache_verified", None)
+            if cache_verified:
+                cache_verified(parsed, cache_candidate)
         except PermissionError as exc:
             self.database.update_case(
                 case_id,
@@ -259,33 +509,6 @@ class JobManager:
         finally:
             part_path.unlink(missing_ok=True)
 
-    def _write_report(self, run_id: str, output_dir: Path) -> str:
-        run = self.database.get_run(run_id)
-        if not run:
-            return ""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = output_dir / f"case-download-report_{timestamp}.xlsx"
-        try:
-            return str(create_xlsx_report(run, report_path))
-        except Exception as xlsx_error:
-            try:
-                paths = create_fallback_reports(run)
-                self.database.update_run(
-                    run_id,
-                    error_message=(
-                        f"Excel report failed ({xlsx_error}); fallback reports were created"
-                    ),
-                )
-                return "; ".join(str(path) for path in paths)
-            except Exception as fallback_error:
-                self.database.update_run(
-                    run_id,
-                    error_message=(
-                        f"Report creation failed: {xlsx_error}; fallback failed: {fallback_error}"
-                    ),
-                )
-                return ""
-
     async def _process(
         self, run_id: str, cancel_event: asyncio.Event, retry_only: bool
     ) -> None:
@@ -302,25 +525,43 @@ class JobManager:
                     status="Queued",
                     error_code="",
                     error_message="",
+                    manual_search_url="",
                 )
         else:
             cases = [item for item in run["cases"] if item["status"] == "Queued"]
         cancelled = False
         try:
-            async with CaseRetriever() as retriever:
-                for index, item in enumerate(cases):
-                    if cancel_event.is_set():
-                        cancelled = True
-                        for remaining in cases[index:]:
-                            if remaining["status"] == "Queued":
-                                self.database.update_case(
-                                    remaining["id"],
-                                    status="Cancelled",
-                                    error_code="CANCELLED",
-                                    error_message="Run was cancelled by the user",
+            semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+            try:
+                resolver_context = CaseResolver(database=self.database)
+            except TypeError:
+                resolver_context = CaseResolver()
+            async with resolver_context as resolver:
+                async def process_one(item: dict[str, Any]) -> None:
+                    async with semaphore:
+                        if cancel_event.is_set():
+                            self.database.update_case(
+                                item["id"],
+                                status="Cancelled",
+                                error_code="CANCELLED",
+                                error_message="Run was cancelled by the user",
+                            )
+                            return
+                        try:
+                            async with CaseRetriever() as retriever:
+                                await self._process_case(
+                                    run_id, item, output_dir, retriever, resolver
                                 )
-                        break
-                    await self._process_case(run_id, item, output_dir, retriever)
+                        except Exception as exc:
+                            self.database.update_case(
+                                item["id"],
+                                status="Not saved",
+                                error_code="WORKER_FAILED",
+                                error_message=str(exc),
+                            )
+
+                await asyncio.gather(*(process_one(item) for item in cases))
+            cancelled = cancel_event.is_set()
         except Exception as exc:
             self.database.update_run(
                 run_id,
@@ -332,6 +573,10 @@ class JobManager:
                 for item in current["cases"]:
                     if item["status"] in (
                         "Queued",
+                        "Searching case details",
+                        "Searching web",
+                        "Searching Google",
+                        "Verifying match",
                         "Searching Lawphil",
                         "Searching E-Library",
                         "Searching ChanRobles",
@@ -344,12 +589,35 @@ class JobManager:
                             error_message=str(exc),
                         )
         finally:
-            report_path = await asyncio.to_thread(self._write_report, run_id, output_dir)
             final_run = self.database.get_run(run_id)
             current_status = final_run["status"] if final_run else "Failed"
             if current_status != "Failed":
                 current_status = "Cancelled" if cancelled else "Completed"
-            self.database.update_run(
-                run_id, status=current_status, report_path=report_path
-            )
+            self.database.update_run(run_id, status=current_status)
             self.cancel_events.pop(run_id, None)
+
+    async def _process_selected_case(self, run_id: str, case_id: str) -> None:
+        run = self.database.get_run(run_id)
+        item = self.database.get_case(run_id, case_id)
+        if not run or not item:
+            return
+        self.database.update_run(run_id, status="Running", error_message="")
+        try:
+            try:
+                resolver_context = CaseResolver(database=self.database)
+            except TypeError:
+                resolver_context = CaseResolver()
+            async with resolver_context as resolver:
+                async with CaseRetriever() as retriever:
+                    await self._process_case(
+                        run_id, item, Path(run["output_dir"]), retriever, resolver
+                    )
+        except Exception as exc:
+            self.database.update_case(
+                case_id,
+                status="Not saved",
+                error_code="WORKER_FAILED",
+                error_message=str(exc),
+            )
+        finally:
+            self.database.update_run(run_id, status="Completed")

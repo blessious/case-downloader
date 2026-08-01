@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import random
 import re
 from datetime import datetime, timezone
@@ -11,9 +12,11 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import Browser, Playwright, async_playwright
+from pypdf import PdfReader
 
 from .config import MAX_ATTEMPTS, REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS
 from .domain import ParsedCase, RetrievalAttempt, RetrievalResult
+from .network import trusted_ssl_context
 from .parser import DATE_RE, docket_tokens
 from .pdf_utils import validate_pdf
 
@@ -38,6 +41,8 @@ ALLOWED_HOSTS = {
     "lawphil.net",
     "www.lawphil.net",
     "elibrary.judiciary.gov.ph",
+    "sc.judiciary.gov.ph",
+    "www.sc.judiciary.gov.ph",
     "chanrobles.com",
     "www.chanrobles.com",
 }
@@ -118,6 +123,7 @@ class CaseRetriever:
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS),
             follow_redirects=True,
+            verify=trusted_ssl_context(),
             headers={
                 "User-Agent": (
                     "CasePDFDownloader/1.0 "
@@ -308,6 +314,23 @@ class CaseRetriever:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 403:
                 raise
+            return await self._browser_html(source, url)
+        except httpx.TransportError:
+            return await self._browser_html(source, url)
+
+    async def fetch_text(self, source: str, url: str) -> tuple[str, str]:
+        """Fetch an approved result page, using Chromium for TLS/JavaScript fallbacks."""
+        try:
+            response = await self._request(source, "GET", url)
+            content_type = response.headers.get("content-type", "").casefold()
+            if "application/pdf" in content_type or urlparse(str(response.url)).path.casefold().endswith(".pdf"):
+                reader = PdfReader(io.BytesIO(response.content))
+                text = " ".join(
+                    (page.extract_text() or "") for page in reader.pages[:10]
+                )
+                return text[:100_000], str(response.url)
+            return response.text, str(response.url)
+        except (PermissionError, httpx.HTTPStatusError, httpx.TransportError):
             return await self._browser_html(source, url)
 
     async def _render_pdf(self, source: str, url: str, output_path: Path) -> None:
@@ -511,6 +534,70 @@ class CaseRetriever:
             return True, used_url, warnings, "", ""
         return False, page_url, warnings, "PDF_CREATION_FAILED", "Lawphil document could not be saved as a valid PDF"
 
+    async def _lawphil_direct(
+        self, case: ParsedCase, output_path: Path, page_url: str
+    ) -> tuple[bool, str, list[str], str, str]:
+        try:
+            page_response = await self._request("Lawphil", "GET", page_url)
+        except Exception as exc:
+            return False, page_url, [], "LAWPHIL_PAGE_ERROR", str(exc)
+        page_text = BeautifulSoup(page_response.text, "html.parser").get_text(" ", strip=True)
+        tokens = docket_tokens(case.docket)
+        if tokens and tokens[0] not in re.sub(r"\D", "", page_text[:10_000]):
+            return False, page_url, [], "IDENTITY_MISMATCH", "Lawphil page did not match the expected docket number"
+        if case.decision_date and not _date_matches(page_text[:10_000], case.decision_date):
+            return False, page_url, [], "IDENTITY_MISMATCH", "Lawphil page did not match the expected decision date"
+        success, used_url, warnings = await self._download_or_render(
+            case, "Lawphil", page_url, page_response.text, output_path
+        )
+        if success:
+            return True, used_url, warnings, "", ""
+        return False, page_url, warnings, "PDF_CREATION_FAILED", "Lawphil document could not be saved as a valid PDF"
+
+    async def _trusted_direct(
+        self, case: ParsedCase, output_path: Path, source: str, page_url: str
+    ) -> tuple[bool, str, list[str], str, str]:
+        if urlparse(page_url).path.casefold().endswith(".pdf"):
+            try:
+                response = await self._request(source, "GET", page_url)
+                output_path.write_bytes(response.content)
+                validation = validate_pdf(output_path, case.docket, case.decision_date)
+                if validation.valid:
+                    return True, str(response.url), validation.warnings, "", ""
+                output_path.unlink(missing_ok=True)
+                return (
+                    False,
+                    str(response.url),
+                    validation.warnings,
+                    validation.error_code,
+                    validation.error_message,
+                )
+            except Exception:
+                output_path.unlink(missing_ok=True)
+                return (
+                    False,
+                    page_url,
+                    [],
+                    "SOURCE_PDF_ERROR",
+                    "The approved source PDF could not be downloaded securely.",
+                )
+        try:
+            page_html, resolved_url = await self._html_with_browser_fallback(source, page_url)
+        except Exception as exc:
+            return False, page_url, [], "SOURCE_PAGE_ERROR", str(exc)
+        page_text = BeautifulSoup(page_html, "html.parser").get_text(" ", strip=True)
+        tokens = docket_tokens(case.docket)
+        if tokens and tokens[0] not in docket_tokens(page_text[:20_000]):
+            return False, resolved_url, [], "IDENTITY_MISMATCH", "Decision page did not match the expected docket number"
+        if case.decision_date and not _date_matches(page_text[:20_000], case.decision_date):
+            return False, resolved_url, [], "IDENTITY_MISMATCH", "Decision page did not match the expected date"
+        success, used_url, warnings = await self._download_or_render(
+            case, source, resolved_url, page_html, output_path
+        )
+        if success:
+            return True, used_url, warnings, "", ""
+        return False, resolved_url, warnings, "PDF_CREATION_FAILED", "Decision could not be saved as a valid PDF"
+
     async def _elibrary(
         self, case: ParsedCase, output_path: Path
     ) -> tuple[bool, str, list[str], str, str]:
@@ -675,11 +762,30 @@ class CaseRetriever:
     ) -> RetrievalResult:
         self.attempts = []
         await status_callback("Searching Lawphil")
-        lawphil = await self._lawphil(case, output_path)
+        direct_url = case.metadata_source_url
+        direct_host = urlparse(direct_url).hostname if direct_url else ""
+        direct_source = {
+            "lawphil.net": "Lawphil",
+            "www.lawphil.net": "Lawphil",
+            "elibrary.judiciary.gov.ph": "Supreme Court E-Library",
+            "sc.judiciary.gov.ph": "Supreme Court",
+            "www.sc.judiciary.gov.ph": "Supreme Court",
+            "chanrobles.com": "ChanRobles",
+            "www.chanrobles.com": "ChanRobles",
+        }.get(direct_host or "")
+        lawphil = (
+            await self._lawphil_direct(case, output_path, direct_url)
+            if direct_source == "Lawphil"
+            else (
+                await self._trusted_direct(case, output_path, direct_source, direct_url)
+                if direct_source
+                else await self._lawphil(case, output_path)
+            )
+        )
         if lawphil[0]:
             return RetrievalResult(
                 True,
-                "Lawphil",
+                direct_source or "Lawphil",
                 lawphil[1],
                 str(output_path),
                 attempts=list(self.attempts),
@@ -711,11 +817,13 @@ class CaseRetriever:
             )
         output_path.unlink(missing_ok=True)
         error_code = chanrobles[3] or elibrary[3] or lawphil[3] or "NOT_FOUND"
-        error_message = (
-            f"Lawphil: {lawphil[4] or 'not saved'}; "
-            f"E-Library: {elibrary[4] or 'not saved'}; "
-            f"ChanRobles: {chanrobles[4] or 'not saved'}"
-        )
+        source_codes = {lawphil[3], elibrary[3], chanrobles[3]}
+        if source_codes.issubset({"", "NOT_FOUND", "CASE_NOT_FOUND"}):
+            error_message = "No matching decision was found on the approved legal sources."
+        elif source_codes.intersection({"ACCESS_BLOCKED", "BROWSER_LOAD_FAILED", "SITE_UNAVAILABLE"}):
+            error_message = "The approved legal sources could not be reached or verified securely."
+        else:
+            error_message = "No verified case PDF could be saved from the approved legal sources."
         return RetrievalResult(
             False,
             error_code=error_code,

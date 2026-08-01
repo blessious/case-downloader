@@ -12,8 +12,6 @@ APP_AUTHOR = "Case PDF Downloader"
 APP_DATA_DIR = Path(user_data_dir(APP_NAME, APP_AUTHOR))
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATABASE_PATH = APP_DATA_DIR / "history.sqlite3"
-FALLBACK_REPORT_DIR = APP_DATA_DIR / "reports"
-FALLBACK_REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def default_output_dir() -> Path:
@@ -31,3 +29,4 @@ MAX_FILENAME_LENGTH = 180
 REQUEST_TIMEOUT_SECONDS = 45.0
 MAX_ATTEMPTS = 3
 REQUEST_DELAY_SECONDS = 0.8
+DOWNLOAD_CONCURRENCY = max(1, int(os.environ.get("CASE_DOWNLOADER_CONCURRENCY", "4")))

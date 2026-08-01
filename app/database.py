@@ -51,6 +51,9 @@ class Database:
                     title TEXT NOT NULL,
                     docket TEXT NOT NULL,
                     decision_date TEXT NOT NULL,
+                    reporter_citation TEXT NOT NULL DEFAULT '',
+                    metadata_source TEXT NOT NULL DEFAULT '',
+                    metadata_source_url TEXT NOT NULL DEFAULT '',
                     raw_text TEXT NOT NULL,
                     filename TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -59,6 +62,7 @@ class Database:
                     source_url TEXT NOT NULL DEFAULT '',
                     error_code TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
+                    manual_search_url TEXT NOT NULL DEFAULT '',
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -78,8 +82,42 @@ class Database:
                     finished_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_attempts_run ON attempts(run_id, case_id);
+                CREATE TABLE IF NOT EXISTS case_candidates (
+                    id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    rank INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    docket TEXT NOT NULL,
+                    decision_date TEXT NOT NULL,
+                    reporter_citation TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    reasons_json TEXT NOT NULL DEFAULT '[]',
+                    verified INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_candidates_case
+                    ON case_candidates(case_id, rank);
+                CREATE TABLE IF NOT EXISTS case_lookup_cache (
+                    lookup_key TEXT PRIMARY KEY,
+                    candidate_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+            case_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(cases)").fetchall()
+            }
+            for column in (
+                "reporter_citation",
+                "metadata_source",
+                "metadata_source_url",
+                "manual_search_url",
+            ):
+                if column not in case_columns:
+                    db.execute(
+                        f"ALTER TABLE cases ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
             now = utc_now()
             db.execute(
                 """
@@ -96,6 +134,10 @@ class Database:
                     error_message='Application closed before this case completed'
                 WHERE status IN (
                     'Queued',
+                    'Searching case details',
+                    'Searching web',
+                    'Searching Google',
+                    'Verifying match',
                     'Searching Lawphil',
                     'Searching E-Library',
                     'Searching ChanRobles',
@@ -117,9 +159,10 @@ class Database:
                 db.execute(
                     """
                     INSERT INTO cases(
-                        id,run_id,ordinal,week,title,docket,decision_date,raw_text,filename,status,
+                        id,run_id,ordinal,week,title,docket,decision_date,reporter_citation,
+                        metadata_source,metadata_source_url,raw_text,filename,status,
                         warnings_json,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,'Queued',?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'Queued',?,?,?)
                     """,
                     (
                         item["id"],
@@ -129,6 +172,9 @@ class Database:
                         item["title"],
                         item["docket"],
                         item["decision_date"],
+                        item.get("reporter_citation", ""),
+                        item.get("metadata_source", ""),
+                        item.get("metadata_source_url", ""),
                         item.get("raw_text", ""),
                         item["filename"],
                         json.dumps(item.get("warnings", [])),
@@ -152,11 +198,17 @@ class Database:
     def update_case(self, case_id: str, **fields: Any) -> None:
         allowed = {
             "status",
+            "docket",
+            "decision_date",
+            "reporter_citation",
+            "metadata_source",
+            "metadata_source_url",
             "saved_path",
             "source",
             "source_url",
             "error_code",
             "error_message",
+            "manual_search_url",
             "warnings_json",
         }
         values = {key: value for key, value in fields.items() if key in allowed}
@@ -205,6 +257,90 @@ class Database:
                 ),
             )
 
+    def set_case_candidates(self, case_id: str, candidates: list[dict[str, Any]]) -> None:
+        with self._lock, self.connect() as db:
+            db.execute("DELETE FROM case_candidates WHERE case_id=?", (case_id,))
+            for rank, candidate in enumerate(candidates, start=1):
+                db.execute(
+                    """
+                    INSERT INTO case_candidates(
+                        id,case_id,rank,title,docket,decision_date,reporter_citation,
+                        source,source_url,score,reasons_json,verified
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        case_id,
+                        rank,
+                        candidate.get("title", ""),
+                        candidate.get("docket", ""),
+                        candidate.get("decision_date", ""),
+                        candidate.get("reporter_citation", ""),
+                        candidate.get("source", ""),
+                        candidate.get("source_url", ""),
+                        float(candidate.get("score", 0)),
+                        json.dumps(candidate.get("reasons", [])),
+                        1 if candidate.get("verified") else 0,
+                    ),
+                )
+
+    def clear_case_candidates(self, case_id: str) -> None:
+        with self._lock, self.connect() as db:
+            db.execute("DELETE FROM case_candidates WHERE case_id=?", (case_id,))
+
+    @staticmethod
+    def _decode_candidate(row: sqlite3.Row) -> dict[str, Any]:
+        candidate = dict(row)
+        candidate["reasons"] = json.loads(candidate.pop("reasons_json") or "[]")
+        candidate["verified"] = bool(candidate["verified"])
+        return candidate
+
+    def get_case_candidate(self, case_id: str, candidate_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM case_candidates WHERE id=? AND case_id=?",
+                (candidate_id, case_id),
+            ).fetchone()
+        return self._decode_candidate(row) if row else None
+
+    def get_case(self, run_id: str, case_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM cases WHERE id=? AND run_id=?", (case_id, run_id)
+            ).fetchone()
+        return self._decode_case(row) if row else None
+
+    def get_cached_candidates(self, lookup_keys: list[str]) -> list[dict[str, Any]]:
+        if not lookup_keys:
+            return []
+        placeholders = ",".join("?" for _ in lookup_keys)
+        with self.connect() as db:
+            rows = db.execute(
+                f"SELECT candidate_json FROM case_lookup_cache WHERE lookup_key IN ({placeholders})",
+                tuple(lookup_keys),
+            ).fetchall()
+        unique: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            candidate = json.loads(row["candidate_json"])
+            unique[candidate.get("source_url", "")] = candidate
+        return list(unique.values())
+
+    def cache_candidate(self, lookup_keys: list[str], candidate: dict[str, Any]) -> None:
+        payload = json.dumps(candidate)
+        now = utc_now()
+        with self._lock, self.connect() as db:
+            for lookup_key in lookup_keys:
+                db.execute(
+                    """
+                    INSERT INTO case_lookup_cache(lookup_key,candidate_json,updated_at)
+                    VALUES(?,?,?)
+                    ON CONFLICT(lookup_key) DO UPDATE SET
+                        candidate_json=excluded.candidate_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (lookup_key, payload, now),
+                )
+
     @staticmethod
     def _decode_case(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
@@ -222,34 +358,44 @@ class Database:
             attempts = db.execute(
                 "SELECT * FROM attempts WHERE run_id=? ORDER BY id", (run_id,)
             ).fetchall()
+            candidate_rows = db.execute(
+                """
+                SELECT cc.* FROM case_candidates cc
+                JOIN cases c ON c.id=cc.case_id
+                WHERE c.run_id=? ORDER BY cc.case_id,cc.rank
+                """,
+                (run_id,),
+            ).fetchall()
         result = dict(run)
-        result["cases"] = [self._decode_case(row) for row in cases]
+        candidates_by_case: dict[str, list[dict[str, Any]]] = {}
+        for row in candidate_rows:
+            candidate = self._decode_candidate(row)
+            candidates_by_case.setdefault(candidate["case_id"], []).append(candidate)
+        result["cases"] = []
+        for row in cases:
+            case = self._decode_case(row)
+            case["candidates"] = candidates_by_case.get(case["id"], [])
+            result["cases"].append(case)
         result["attempts"] = [dict(row) for row in attempts]
         return result
-
-    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute(
-                """
-                SELECT r.*,
-                    COUNT(c.id) AS total,
-                    SUM(CASE WHEN c.status='Saved' THEN 1 ELSE 0 END) AS saved,
-                    SUM(CASE WHEN c.status='Already saved' THEN 1 ELSE 0 END) AS already_saved,
-                    SUM(CASE WHEN c.status IN ('Not saved','Duplicate input') THEN 1 ELSE 0 END) AS not_saved
-                FROM runs r LEFT JOIN cases c ON c.run_id=r.id
-                GROUP BY r.id ORDER BY r.created_at DESC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [dict(row) for row in rows]
 
     def cases_for_retry(self, run_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
             rows = db.execute(
                 """
                 SELECT * FROM cases WHERE run_id=?
-                AND status='Not saved'
-                AND error_code NOT IN ('PARSE_ERROR','FILENAME_COLLISION','EXISTING_FILE_INVALID')
+                AND (
+                    (
+                        status='Not saved'
+                        AND error_code NOT IN (
+                            'PARSE_ERROR','FILENAME_COLLISION','EXISTING_FILE_INVALID'
+                        )
+                    )
+                    OR (
+                        status='Needs review'
+                        AND error_code IN ('GOOGLE_SEARCH_BLOCKED','GOOGLE_SEARCH_FAILED')
+                    )
+                )
                 ORDER BY ordinal
                 """,
                 (run_id,),

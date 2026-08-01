@@ -217,6 +217,44 @@ async def test_browser_is_used_when_chanrobles_rejects_plain_http(
 
 
 @pytest.mark.asyncio
+async def test_verified_supreme_court_pdf_is_saved_directly(tmp_path: Path) -> None:
+    pdf = blank_pdf()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=pdf,
+            headers={"content-type": "application/pdf"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+    source_url = "https://sc.judiciary.gov.ph/wp-content/uploads/case.pdf"
+    case = ParsedCase(
+        1,
+        "Week 2",
+        "Example v. Respondent",
+        "G.R. No. 145561",
+        "2005-06-15",
+        "",
+        metadata_source="Supreme Court",
+        metadata_source_url=source_url,
+    )
+
+    async def status(_value: str) -> None:
+        return None
+
+    target = tmp_path / "direct.part"
+    async with CaseRetriever(client) as retriever:
+        result = await retriever.retrieve(case, target, status)
+    await client.aclose()
+    assert result.success
+    assert result.source == "Supreme Court"
+    assert result.source_url == source_url
+    assert target.read_bytes().startswith(b"%PDF")
+
+
+@pytest.mark.asyncio
 async def test_lawphil_render_removes_cookie_notice(tmp_path: Path) -> None:
     case = ParsedCase(
         1,

@@ -12,6 +12,10 @@ class FolderRequest(BaseModel):
     create: bool = True
 
 
+class CandidateSelectionRequest(BaseModel):
+    candidate_id: str = Field(min_length=1)
+
+
 class CaseRequest(BaseModel):
     ordinal: int = Field(ge=1)
     week: str = "Uncategorized"
@@ -21,6 +25,14 @@ class CaseRequest(BaseModel):
     raw_text: str = ""
     parse_error: str = ""
     warnings: list[str] = Field(default_factory=list)
+    reporter_citation: str = ""
+    metadata_source: str = ""
+    metadata_source_url: str = ""
+    resolution_status: str = "ready"
+
+
+class ResolveCasesRequest(BaseModel):
+    cases: list[CaseRequest] = Field(min_length=1)
 
 
 class RunRequest(BaseModel):

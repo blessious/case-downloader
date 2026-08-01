@@ -15,6 +15,9 @@ class ParsedCase:
     raw_text: str
     parse_error: str = ""
     warnings: list[str] = field(default_factory=list)
+    reporter_citation: str = ""
+    metadata_source: str = ""
+    metadata_source_url: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,6 +53,7 @@ FINAL_STATUSES = {
     "Not saved",
     "Duplicate input",
     "Cancelled",
+    "Needs review",
 }
 
 

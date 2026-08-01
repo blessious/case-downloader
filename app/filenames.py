@@ -7,7 +7,7 @@ from .config import MAX_FILENAME_LENGTH
 
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-VERSUS = re.compile(r"(?<!\w)(?:v(?:s)?\.?)(?!\w)", re.IGNORECASE)
+VERSUS = re.compile(r"(?<!\w)(?:v(?:s)?\.?|versus)(?!\w)", re.IGNORECASE)
 WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -48,7 +48,13 @@ def safe_week_folder(week: str) -> str:
     match = re.fullmatch(r"\s*week\s*(\d+)\s*", week, re.IGNORECASE)
     if match:
         return f"Week {int(match.group(1))}"
-    return "Uncategorized"
+    clean = INVALID_FILENAME_CHARS.sub("-", re.sub(r"\s+", " ", week).strip())
+    clean = clean.strip(". ")
+    if not clean:
+        return "Uncategorized"
+    if clean.upper() in WINDOWS_RESERVED:
+        clean = f"_{clean}"
+    return clean[:80]
 
 
 def path_too_long(path: Path) -> bool:

@@ -30,5 +30,6 @@ def test_reserved_name_and_length() -> None:
 
 def test_week_folder_and_path_limit() -> None:
     assert safe_week_folder("week 02") == "Week 2"
-    assert safe_week_folder("Section A") == "Uncategorized"
+    assert safe_week_folder("Section A") == "Section A"
+    assert safe_week_folder("..") == "Uncategorized"
     assert path_too_long(Path("C:/") / ("a" * 250))

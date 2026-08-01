@@ -5,259 +5,215 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="A personal tool for downloading full-text Philippine cases."
+      content="A local utility for downloading full-text Philippine Supreme Court cases."
     />
     <title>Case Downloader</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,600;6..72,700&family=Public+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <div class="app-shell">
-      <div class="mac-window">
-        <header class="titlebar">
-          <div class="window-controls" aria-hidden="true">
-            <span class="window-dot close"></span>
-            <span class="window-dot minimize"></span>
-            <span class="window-dot maximize"></span>
+    <div class="surface-grid app-shell">
+      <header class="app-header">
+        <div class="header-inner">
+          <div class="brand-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" role="img">
+              <path d="m16 16 3-8 3 8a5 5 0 0 1-6 0Z"></path>
+              <path d="m2 16 3-8 3 8a5 5 0 0 1-6 0Z"></path>
+              <path d="M7 21h10"></path>
+              <path d="M12 3v18"></path>
+              <path d="M3 7h18"></path>
+            </svg>
           </div>
-          <strong>Case Downloader</strong>
-          <div class="source-label">
-            <span aria-hidden="true">✦</span>
-            <span>Lawphil · SC E-Library · ChanRobles</span>
+          <div class="brand-copy">
+            <h1>Case Downloader</h1>
+            <p>Lawphil → SC E-Library · full-text PDFs</p>
           </div>
-        </header>
-
-        <div class="toolbar">
-          <nav class="workflow-nav" aria-label="Workflow steps">
-            <button class="workflow-step active" id="workflow-input" type="button">
-              <span aria-hidden="true">▤</span> Input
-            </button>
-            <button class="workflow-step" id="workflow-review" type="button" disabled>
-              <span aria-hidden="true">♡</span> Review
-            </button>
-            <button class="workflow-step" id="workflow-download" type="button" disabled>
-              <span aria-hidden="true">⇩</span> Download
-            </button>
-            <button class="workflow-step" id="history-button" type="button">
-              <span aria-hidden="true">◷</span> History
-            </button>
-          </nav>
-          <span class="queue-count" id="queue-count">No cases loaded</span>
+          <button class="icon-button theme-toggle" id="theme-toggle" type="button" aria-label="Switch to dark theme">
+            <svg class="sun-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="4"></circle>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.42"></path>
+            </svg>
+            <svg class="moon-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path>
+            </svg>
+          </button>
         </div>
+      </header>
 
-        <div class="window-content">
-          <div id="alert" class="alert hidden" role="alert"></div>
+      <main class="main-content">
+        <nav class="workflow-nav" aria-label="Workflow steps">
+          <button class="workflow-step active" id="workflow-input" type="button">1 · Input</button>
+          <button class="workflow-step" id="workflow-review" type="button" disabled>2 · Review</button>
+          <button class="workflow-step" id="workflow-download" type="button" disabled>3 · Download</button>
+        </nav>
 
-          <section id="setup-section">
-            <div class="input-layout">
-              <section class="soft-panel paste-card">
-                <header class="card-heading">
-                  <div>
-                    <span class="eyebrow">Assigned cases</span>
-                    <h1>Download case PDFs</h1>
-                  </div>
-                  <span class="heading-icon" aria-hidden="true">▤</span>
-                </header>
+        <div id="alert" class="alert hidden" role="alert"></div>
 
-                <div class="input-tabs" role="tablist" aria-label="Input method">
-                  <button class="tab active" id="paste-tab" type="button" role="tab">
-                    Paste list
-                  </button>
-                  <button class="tab" id="docx-tab" type="button" role="tab">
-                    Upload Word file
+        <section id="setup-section" class="animate-rise">
+          <section class="card shadow-panel">
+            <header class="card-header">
+              <div class="heading-row">
+                <div>
+                  <h2>Assigned cases</h2>
+                  <p>Paste your list or upload a DOCX or text-based PDF syllabus. Different citation formats and missing case details are supported.</p>
+                </div>
+                <span class="badge secondary" id="queue-count">No cases loaded</span>
+              </div>
+            </header>
+
+            <div class="card-content">
+              <div class="input-tabs" role="tablist" aria-label="Input method">
+                <button class="tab active" id="paste-tab" type="button" role="tab">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 2H9a2 2 0 0 0-2 2v2h10V4a2 2 0 0 0-2-2Z"></path><path d="M5 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-1"></path><path d="M8 12h8M8 16h6"></path></svg>
+                  Paste list
+                </button>
+                <button class="tab" id="docx-tab" type="button" role="tab">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path><path d="M14 2v6h6M12 18v-6M9 15l3-3 3 3"></path></svg>
+                  Upload syllabus
+                </button>
+              </div>
+
+              <div id="paste-panel" class="input-panel animate-rise">
+                <label class="field-label" for="case-text">Case list</label>
+                <textarea
+                  id="case-text"
+                  rows="12"
+                  spellcheck="false"
+                  placeholder="Mangila vs Court of Appeals (GR No 124027, 12 August 2002)&#10;Mendiola vs Court of Appeals (497 SCRA 346)&#10;JM Tuason & Co., Inc. vs Bolanos (95 Phil 106)"
+                ></textarea>
+                <div class="field-footer">
+                  <span>Missing G.R. numbers and dates are okay when a case title is available.</span>
+                  <button class="button primary" id="parse-text-button" type="button">
+                    Recognize cases
                   </button>
                 </div>
+              </div>
 
-                <div id="paste-panel" class="input-panel">
-                  <label for="case-text">Case list</label>
-                  <textarea
-                    id="case-text"
-                    rows="12"
-                    placeholder="WEEK 2&#10;1. Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda, G.R. No. 145561, June 15, 2005&#10;2. Another Case v. Respondent, G.R. No. 123456, January 1, 2020"
-                  ></textarea>
-                  <div class="field-footer">
-                    <span>Week headings and numbered lists are supported.</span>
-                    <button class="button primary" id="parse-text-button" type="button">
-                      <span aria-hidden="true">✦</span> Recognize cases
-                    </button>
-                  </div>
-                </div>
+              <div id="docx-panel" class="input-panel animate-rise hidden">
+                <label class="drop-zone" for="docx-file">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path><path d="M14 2v6h6M12 18v-6M9 15l3-3 3 3"></path></svg>
+                  <strong id="docx-name">Drop a DOCX or PDF syllabus, or click to browse</strong>
+                  <span>Text-based documents up to 15 MB</span>
+                  <input id="docx-file" type="file" accept=".docx,.pdf" />
+                </label>
 
-                <div id="docx-panel" class="input-panel hidden">
-                  <label class="drop-zone" for="docx-file">
-                    <span class="upload-symbol" aria-hidden="true">W</span>
-                    <strong>Drop or choose a .docx file</strong>
-                    <span>Maximum file size: 15 MB</span>
-                    <input id="docx-file" type="file" accept=".docx" />
+                <div class="syllabus-options">
+                  <label class="field-group" id="page-range-field" for="page-range">
+                    <span class="field-label">PDF pages <span class="optional">(optional)</span></span>
+                    <input id="page-range" type="text" placeholder="4, 7-9" disabled />
+                    <small id="page-range-help">Select a PDF to choose pages. Leave blank to read all pages.</small>
                   </label>
-                  <div class="field-footer">
-                    <span id="docx-name">No document selected</span>
-                    <button class="button primary" id="parse-docx-button" type="button" disabled>
-                      Recognize cases
-                    </button>
-                  </div>
+                  <label class="field-group" for="syllabus-folder-name">
+                    <span class="field-label">Folder name</span>
+                    <input id="syllabus-folder-name" type="text" placeholder="Civil Procedure" />
+                    <small>Cases from this syllabus are saved inside this folder.</small>
+                  </label>
                 </div>
-              </section>
 
-              <aside class="side-stack">
-                <section class="soft-panel info-card">
-                  <span class="heading-icon" aria-hidden="true">⇧</span>
-                  <h2>Upload a DOCX</h2>
-                  <p>
-                    Use the Word file tab to load a syllabus or assignment sheet. Wrapped
-                    lines, week headings, case titles, G.R. numbers, and dates are recognized.
-                  </p>
-                </section>
-                <section class="soft-panel info-card">
-                  <h2>What we recognize</h2>
-                  <ul class="recognition-list">
-                    <li>Week headings such as Week 1</li>
-                    <li>Numbered lists with wrapped lines</li>
-                    <li>Joined G.R. numbers</li>
-                    <li>L-number cases</li>
-                    <li>Full decision dates</li>
-                  </ul>
-                </section>
-              </aside>
+                <div class="field-footer upload-footer">
+                  <span>Individual pages and ranges are supported.</span>
+                  <button class="button primary" id="parse-docx-button" type="button" disabled>
+                    Recognize cases
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="hidden animate-rise" id="review-section">
+          <section class="card shadow-panel">
+            <header class="card-header">
+              <div class="heading-row">
+                <div>
+                  <h2>Review recognized cases</h2>
+                  <p>Every syllabus entry stays visible. Edit the whole entry or remove anything you do not want to download.</p>
+                </div>
+                <div class="review-counts">
+                  <span class="badge secondary" id="case-count">0 cases</span>
+                  <span class="badge warning hidden" id="parse-error-count"></span>
+                </div>
+              </div>
+            </header>
+            <div class="card-content review-content">
+              <div class="notice" id="resolution-message"></div>
+              <div class="case-review-list" id="review-body"></div>
             </div>
           </section>
 
-          <section class="hidden" id="review-section">
-            <div class="section-heading">
-              <div>
-                <span class="eyebrow">Check before downloading</span>
-                <h1>Review parsed cases</h1>
-                <p>Correct highlighted information and confirm the destination folder.</p>
+          <section class="card destination-card">
+            <div class="card-content destination-panel">
+              <div class="destination-copy">
+                <label class="field-label" for="output-dir">Destination folder</label>
+                <small>Windows and macOS absolute paths are supported.</small>
               </div>
-              <div class="review-counts">
-                <span id="case-count">0 cases</span>
-                <span class="danger-text" id="parse-error-count"></span>
-              </div>
-            </div>
-
-            <section class="soft-panel review-panel">
-              <div class="table-wrap review-table-wrap">
-                <table class="data-table review-table">
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Week</th>
-                      <th>Case title / filename</th>
-                      <th>G.R. number</th>
-                      <th>Date</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody id="review-body"></tbody>
-                </table>
-              </div>
-
-              <div class="destination-block">
-                <div class="destination-copy">
-                  <label for="output-dir">Destination folder</label>
-                  <small>Windows and macOS absolute paths are supported.</small>
-                </div>
+              <div class="path-section">
                 <div class="path-control">
                   <input id="output-dir" type="text" spellcheck="false" />
-                  <button class="button secondary" id="validate-folder-button" type="button">
-                    Check folder
-                  </button>
+                  <button class="button outline" id="validate-folder-button" type="button">Check folder</button>
                 </div>
                 <p class="folder-message" id="folder-message"></p>
               </div>
-
-              <div class="review-actions">
-                <button class="button quiet" id="back-button" type="button">← Back to input</button>
-                <div>
-                  <span class="save-rule">Existing PDFs are never overwritten.</span>
-                  <button class="button primary" id="start-button" type="button">
-                    Continue to download <span aria-hidden="true">→</span>
-                  </button>
-                </div>
-              </div>
-            </section>
+            </div>
           </section>
 
-          <section class="hidden" id="run-section">
-            <section class="soft-panel run-heading">
+          <div class="review-actions">
+            <button class="button ghost" id="back-button" type="button">Back to input</button>
+            <div class="continue-actions">
+              <span class="save-rule">Existing PDFs are never overwritten.</span>
+              <button class="button primary" id="start-button" type="button">Continue to download</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="hidden animate-rise" id="run-section">
+          <section class="card shadow-panel">
+            <header class="card-header run-heading">
               <div>
-                <span class="eyebrow">Download queue</span>
-                <h1 id="run-title">Downloading cases</h1>
-                <p id="run-subtitle">Checking Lawphil, the E-Library, then ChanRobles.</p>
+                <h2 id="run-title">Downloading cases</h2>
+                <p id="run-subtitle">Checking Lawphil, the Supreme Court E-Library, then ChanRobles.</p>
               </div>
               <div class="run-actions">
-                <button class="button danger hidden" id="cancel-button" type="button">
-                  Cancel
-                </button>
-                <button class="button secondary hidden" id="retry-button" type="button">
-                  Retry not saved
-                </button>
-                <a class="button primary hidden" id="report-button" href="#">Download report</a>
+                <button class="button destructive hidden" id="cancel-button" type="button">Cancel</button>
+                <button class="button outline hidden" id="retry-button" type="button">Retry not saved</button>
               </div>
-            </section>
-
-            <div class="progress-track"><div id="progress-bar"></div></div>
-
-            <div class="stat-grid">
-              <div class="stat total"><span>Total</span><strong id="stat-total">0</strong></div>
-              <div class="stat success"><span>Saved</span><strong id="stat-saved">0</strong></div>
-              <div class="stat existing">
-                <span>Already saved</span><strong id="stat-existing">0</strong>
+            </header>
+            <div class="card-content run-content">
+              <div class="progress-track" aria-label="Download progress"><div id="progress-bar"></div></div>
+              <div class="results-toolbar">
+                <div class="filter-group" role="group" aria-label="Filter results">
+                  <button class="filter active" data-filter="all" type="button">All</button>
+                  <button class="filter" data-filter="active" type="button">Working</button>
+                  <button class="filter" data-filter="saved" type="button">Saved</button>
+                  <button class="filter" data-filter="failed" type="button">Not saved</button>
+                </div>
+                <span id="last-updated"></span>
               </div>
-              <div class="stat failure"><span>Not saved</span><strong id="stat-failed">0</strong></div>
-            </div>
-
-            <div class="results-toolbar">
-              <div class="filter-group" role="group" aria-label="Filter results">
-                <button class="filter active" data-filter="all" type="button">All</button>
-                <button class="filter" data-filter="active" type="button">Working</button>
-                <button class="filter" data-filter="saved" type="button">Saved</button>
-                <button class="filter" data-filter="failed" type="button">Not saved</button>
-              </div>
-              <span id="last-updated"></span>
-            </div>
-
-            <section class="soft-panel results-panel">
               <div class="table-wrap">
                 <table class="data-table result-table">
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Case</th>
-                      <th>Week</th>
-                      <th>Status</th>
-                      <th>Details</th>
-                    </tr>
-                  </thead>
+                  <thead><tr><th>#</th><th>Syllabus entry</th><th>Status</th><th>Details</th></tr></thead>
                   <tbody id="results-body"></tbody>
                 </table>
               </div>
-            </section>
-
-            <div class="not-saved-panel hidden" id="not-saved-panel">
-              Unsuccessful cases are included in the report’s <strong>Not Saved</strong> sheet.
             </div>
           </section>
-
-          <section class="hidden" id="history-section">
-            <div class="section-heading">
-              <div>
-                <span class="eyebrow">Stored on this computer</span>
-                <h1>Run history</h1>
-                <p>Reopen results from a previous download.</p>
-              </div>
-              <button class="button quiet compact" id="close-history-button" type="button">
-                Close
-              </button>
-            </div>
-            <div id="history-list" class="history-list"></div>
-          </section>
-        </div>
-      </div>
+        </section>
+      </main>
 
       <footer class="page-footer">
         <span>Case Downloader <b id="app-version"></b></span>
-        <span>A calm personal utility · local only · your files stay on this computer</span>
+        <span>Local only · your files stay on this computer</span>
       </footer>
+    </div>
+
+    <div class="undo-toast hidden" id="undo-toast" role="status" aria-live="polite">
+      <span>Case removed</span>
+      <button id="undo-delete-button" type="button">Undo</button>
     </div>
     <script src="/static/app.js" defer></script>
   </body>
