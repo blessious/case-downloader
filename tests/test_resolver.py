@@ -24,7 +24,8 @@ from app.resolver import (
 async def test_reporter_citation_search_returns_matching_candidate() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        assert "497+SCRA+346" in str(request.url)
+        if "/api/" not in str(request.url):
+            return httpx.Response(200, text="G.R. No. 159333 July 31, 2006 Arsenio T. Mendiola v. Court of Appeals 497 SCRA 346 DECISION", request=request)
         return httpx.Response(
             200,
             json={
@@ -33,7 +34,7 @@ async def test_reporter_citation_search_returns_matching_candidate() -> None:
                         "gr_number": "G.R. No. 159333",
                         "date": "2006-07-31T00:00:00.000000Z",
                         "citation": "Arsenio T. Mendiola vs. Court of Appeals, et al.",
-                        "reference": "497 SCRA",
+                        "reference": "497 SCRA 346",
                         "url": "juri2006/jul2006/gr_159333_2006.html",
                     }
                 ]
@@ -62,6 +63,8 @@ async def test_reporter_citation_search_returns_matching_candidate() -> None:
 @pytest.mark.asyncio
 async def test_exact_docket_accepts_expanded_title_for_abbreviated_syllabus_title() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/api/" not in str(request.url):
+            return httpx.Response(200, text="G.R. Nos. 167707 and 173775 October 8, 2008 The Secretary of the Department of Environment and Natural Resources v. Mayor Jose S. Yap DECISION", request=request)
         return httpx.Response(
             200,
             json={
@@ -87,7 +90,7 @@ async def test_exact_docket_accepts_expanded_title_for_abbreviated_syllabus_titl
         "Uncategorized",
         "DENR Sec. v. Yap",
         "G.R. No. 167707",
-        "",
+        "2008-10-08",
         "DENR Sec. v. Yap, GR No. 167707",
     )
     async with CaseResolver(client) as resolver:
@@ -98,7 +101,7 @@ async def test_exact_docket_accepts_expanded_title_for_abbreviated_syllabus_titl
     assert candidates[0].decision_date == "2008-10-08"
 
 
-def test_unique_title_match_auto_fills_missing_metadata() -> None:
+def test_unverified_candidate_does_not_auto_fill_metadata() -> None:
     row = {
         "title": "Mendiola v. Court of Appeals",
         "docket": "",
@@ -115,10 +118,9 @@ def test_unique_title_match_auto_fills_missing_metadata() -> None:
         "https://lawphil.net/example",
     )
     resolved = apply_resolution(row, [candidate])
-    assert resolved["resolution_status"] == "auto_filled"
-    assert resolved["docket"] == "G.R. No. 159333"
-    assert resolved["decision_date"] == "2006-07-31"
-    assert resolved["warnings"] == []
+    assert resolved["resolution_status"] == "needs_review"
+    assert resolved["docket"] == ""
+    assert resolved["original_input"]["reporter_citation"] == "497 SCRA 346"
 
 
 def test_multiple_candidates_require_review() -> None:
@@ -157,11 +159,12 @@ async def test_google_discovers_and_verifies_an_approved_source(monkeypatch: pyt
         return (
             "<html><body>G.R. No. 137705 August 22, 2000 "
             "SERG'S PRODUCTS, INC. v. PCI LEASING AND FINANCE, INC. "
-            "338 SCRA 499</body></html>",
+            "338 SCRA 499 DECISION</body></html>",
             url,
         )
 
     resolver = CaseResolver(google_searcher=search_google)
+    monkeypatch.setattr(resolver, "_direct_discovery", lambda *_args: _async_value([]))
     monkeypatch.setattr(resolver, "_search_lawphil", lambda _query: _async_value([]))
     try:
         candidates = await resolver.candidates(case, fetch_page)
@@ -203,9 +206,13 @@ async def test_unapproved_result_is_only_a_metadata_clue(monkeypatch: pytest.Mon
         }]
 
     resolver = CaseResolver(google_searcher=google)
+    monkeypatch.setattr(resolver, "_direct_discovery", lambda *_args: _async_value([]))
     monkeypatch.setattr(resolver, "_search_lawphil", lawphil)
+    async def fetch(_source, url):
+        return "G.R. No. 137705 August 22, 2000 Serg's Products, Inc. v. PCI Leasing and Finance, Inc. 338 SCRA 499 DECISION", url
+
     try:
-        candidates = await resolver.candidates(case)
+        candidates = await resolver.candidates(case, fetch)
     finally:
         await resolver.__aexit__()
 
@@ -221,6 +228,7 @@ async def test_blocked_google_search_provides_manual_url_after_official_lookup(
         raise GoogleSearchBlocked("Google paused automated searching", google_search_url(query))
 
     resolver = CaseResolver(google_searcher=blocked)
+    monkeypatch.setattr(resolver, "_direct_discovery", lambda *_args: _async_value([]))
     monkeypatch.setattr(resolver, "_search_lawphil", lambda _query: _async_value([]))
     case = ParsedCase(1, "Uncategorized", "Unknown v. Missing", "", "", "Unknown v. Missing")
     try:
@@ -232,32 +240,30 @@ async def test_blocked_google_search_provides_manual_url_after_official_lookup(
 
 
 @pytest.mark.asyncio
-async def test_verified_mapping_cache_skips_network(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_verified_mapping_cache_is_reverified(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     database = Database(tmp_path / "cache.sqlite3")
-    case = ParsedCase(1, "Uncategorized", "Alpha v. Beta", "G.R. No. 123456", "", "Alpha v. Beta")
-    saved = CaseCandidate(
-        "Alpha v. Beta", "G.R. No. 123456", "2020-01-02", "", "Lawphil",
-        "https://lawphil.net/example", score=110, reasons=["Exact docket number"], verified=True,
-    )
-    resolver = CaseResolver(database=database)
-    resolver.cache_verified(case, saved)
-
-    async def unexpected(_query: str):
-        raise AssertionError("network lookup should not run for a verified cache hit")
-
-    monkeypatch.setattr(resolver, "_search_lawphil", unexpected)
+    case = ParsedCase(1, "Uncategorized", "Alpha v. Beta", "G.R. No. 123456", "2020-01-02", "Alpha v. Beta")
+    saved = CaseCandidate("Alpha v. Beta", "G.R. No. 123456", "2020-01-02", "", "Lawphil", "https://lawphil.net/example", score=110, verified=True)
+    resolver = CaseResolver(database=database, google_searcher=lambda _q: _async_value([]))
+    database.cache_candidate(["docket:123456"], saved.as_dict())
+    calls = []
+    async def fetch(_source, url):
+        calls.append(url)
+        return "G.R. No. 123456 January 2, 2020 Alpha v. Beta DECISION", url
+    monkeypatch.setattr(resolver, "_search_lawphil", lambda _q: _async_value([]))
     try:
-        candidates = await resolver.candidates(case)
+        candidates = await resolver.candidates(case, fetch)
     finally:
         await resolver.__aexit__()
-    assert candidates[0].source_url == saved.source_url
-    assert candidates[0].verified is True
+    assert calls == [saved.source_url]
+    assert candidates[0].verified
+
 
 
 def test_close_verified_candidates_are_ambiguous() -> None:
     candidates = [
-        CaseCandidate("A v. B", "G.R. No. 1", "2000-01-01", "", "Lawphil", "https://lawphil.net/1", 90, verified=True),
-        CaseCandidate("A v. B", "G.R. No. 2", "2001-01-01", "", "Supreme Court", "https://sc.judiciary.gov.ph/2", 82, verified=True),
+        CaseCandidate("A v. B", "G.R. No. 1", "2000-01-01", "", "Lawphil", "https://lawphil.net/1", 90, verified=True, verification={"outcome": "verified"}),
+        CaseCandidate("A v. B", "G.R. No. 2", "2001-01-01", "", "Supreme Court", "https://sc.judiciary.gov.ph/2", 82, verified=True, verification={"outcome": "verified"}),
     ]
     assert candidates_are_ambiguous(candidates)
 

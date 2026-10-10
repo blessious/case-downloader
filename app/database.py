@@ -118,6 +118,12 @@ class Database:
                     db.execute(
                         f"ALTER TABLE cases ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                     )
+            for column, default in (("original_input_json", "{}"), ("verification_json", "{}"), ("failure_stage", "")):
+                if column not in case_columns:
+                    db.execute(f"ALTER TABLE cases ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default}'")
+            candidate_columns = {row["name"] for row in db.execute("PRAGMA table_info(case_candidates)")}
+            if "verification_json" not in candidate_columns:
+                db.execute("ALTER TABLE case_candidates ADD COLUMN verification_json TEXT NOT NULL DEFAULT '{}'")
             now = utc_now()
             db.execute(
                 """
@@ -182,6 +188,8 @@ class Database:
                         now,
                     ),
                 )
+                original = item.get("original_input") or {key: item.get(key, "") for key in ("title", "docket", "decision_date", "reporter_citation")}
+                db.execute("UPDATE cases SET original_input_json=? WHERE id=?", (json.dumps(original), item["id"]))
         return run_id
 
     def update_run(self, run_id: str, **fields: Any) -> None:
@@ -210,8 +218,24 @@ class Database:
             "error_message",
             "manual_search_url",
             "warnings_json",
+            "verification_json",
+            "failure_stage",
         }
         values = {key: value for key, value in fields.items() if key in allowed}
+        if "original_input" in fields:
+            values["original_input_json"] = json.dumps(fields["original_input"])
+        if "verification" in fields:
+            values["verification_json"] = json.dumps(fields["verification"])
+        code = str(fields.get("error_code", ""))
+        if code and "failure_stage" not in fields:
+            values["failure_stage"] = (
+                "pdf_validation" if "PDF" in code or code == "EXISTING_FILE_INVALID"
+                else "filesystem" if any(t in code for t in ("FILE_", "FOLDER", "PATH_", "DISK"))
+                else "identity" if any(t in code for t in ("IDENTITY", "MATCH", "VERIFICATION"))
+                else "discovery" if any(t in code for t in ("GOOGLE", "LOOKUP", "CASE_NOT_FOUND"))
+                else "retrieval")
+        if fields.get("status") in {"Saved", "Already saved"}:
+            values["failure_stage"] = ""
         if "warnings" in fields:
             values["warnings_json"] = json.dumps(fields["warnings"])
         values["updated_at"] = utc_now()
@@ -283,6 +307,8 @@ class Database:
                         1 if candidate.get("verified") else 0,
                     ),
                 )
+                db.execute("UPDATE case_candidates SET verification_json=? WHERE case_id=? AND rank=?", (json.dumps(candidate.get("verification", {})), case_id, rank))
+
 
     def clear_case_candidates(self, case_id: str) -> None:
         with self._lock, self.connect() as db:
@@ -293,6 +319,7 @@ class Database:
         candidate = dict(row)
         candidate["reasons"] = json.loads(candidate.pop("reasons_json") or "[]")
         candidate["verified"] = bool(candidate["verified"])
+        candidate["verification"] = json.loads(candidate.pop("verification_json", "{}") or "{}")
         return candidate
 
     def get_case_candidate(self, case_id: str, candidate_id: str) -> dict[str, Any] | None:
@@ -345,6 +372,8 @@ class Database:
     def _decode_case(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["warnings"] = json.loads(item.pop("warnings_json") or "[]")
+        item["original_input"] = json.loads(item.pop("original_input_json", "{}") or "{}")
+        item["verification"] = json.loads(item.pop("verification_json", "{}") or "{}")
         return item
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -376,6 +405,7 @@ class Database:
             case = self._decode_case(row)
             case["candidates"] = candidates_by_case.get(case["id"], [])
             result["cases"].append(case)
+        result["verified_count"] = sum(c["status"] in {"Saved", "Already saved"} and c["verification"].get("outcome") == "verified" for c in result["cases"])
         result["attempts"] = [dict(row) for row in attempts]
         return result
 
@@ -393,7 +423,7 @@ class Database:
                     )
                     OR (
                         status='Needs review'
-                        AND error_code IN ('GOOGLE_SEARCH_BLOCKED','GOOGLE_SEARCH_FAILED')
+                        AND error_code NOT IN ('PARSE_ERROR','FILENAME_COLLISION','EXISTING_FILE_INVALID')
                     )
                 )
                 ORDER BY ordinal

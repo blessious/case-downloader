@@ -8,15 +8,49 @@ import pytest
 from pypdf import PdfReader, PdfWriter
 
 from app.domain import ParsedCase
-from app.retrieval import CaseRetriever
+from app.retrieval import CHANROBLES_CONTENT_SELECTOR, CaseRetriever
+
+
+from pdf_factory import identity_pdf
 
 
 def blank_pdf() -> bytes:
-    writer = PdfWriter()
-    writer.add_blank_page(width=612, height=792)
-    stream = io.BytesIO()
-    writer.write(stream)
-    return stream.getvalue()
+    # Existing success fixtures now contain verifiable decision identity.
+    return identity_pdf()
+
+
+class FakePrintPage:
+    def __init__(self, content_found: bool = True) -> None:
+        self.content_found = content_found
+        self.arguments: list[str | None] = []
+
+    async def evaluate(self, _script: str, argument: str | None) -> bool:
+        self.arguments.append(argument)
+        return self.content_found
+
+
+@pytest.mark.asyncio
+async def test_chanrobles_printing_selects_only_decision_content() -> None:
+    page = FakePrintPage()
+    async with CaseRetriever() as retriever:
+        await retriever._prepare_page_for_pdf(page, "ChanRobles")  # type: ignore[arg-type]
+    assert page.arguments == [CHANROBLES_CONTENT_SELECTOR]
+
+
+@pytest.mark.asyncio
+async def test_chanrobles_printing_refuses_full_page_when_content_is_missing() -> None:
+    page = FakePrintPage(content_found=False)
+    async with CaseRetriever() as retriever:
+        with pytest.raises(RuntimeError, match="decision content was not found"):
+            await retriever._prepare_page_for_pdf(page, "ChanRobles")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_other_sources_keep_their_document_body_when_printing() -> None:
+    page = FakePrintPage()
+    async with CaseRetriever() as retriever:
+        await retriever._prepare_page_for_pdf(page, "Lawphil")  # type: ignore[arg-type]
+    assert page.arguments == [None]
 
 
 @pytest.mark.asyncio
@@ -38,7 +72,7 @@ async def test_lawphil_success_uses_source_pdf(tmp_path: Path) -> None:
             return httpx.Response(
                 200,
                 text=(
-                    "<html><body>G.R. No. 145561 June 15, 2005"
+                    "<html><body>G.R. No. 145561 June 15, 2005 Honda Philippines v. Samahan ng Malayang Manggagawa sa Honda DECISION "
                     '<a href="case.pdf">PDF</a></body></html>'
                 ),
                 request=request,
@@ -56,7 +90,7 @@ async def test_lawphil_success_uses_source_pdf(tmp_path: Path) -> None:
     case = ParsedCase(
         1,
         "Week 2",
-        "Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda",
+        "Honda Philippines, Inc. v. Samahan ng Malayang Manggagawa sa Honda",
         "G.R. No. 145561",
         "2005-06-15",
         "",
@@ -72,7 +106,7 @@ async def test_lawphil_success_uses_source_pdf(tmp_path: Path) -> None:
     assert result.success
     assert result.source == "Lawphil"
     assert (tmp_path / "case.part").exists()
-    assert statuses == ["Searching Lawphil"]
+    assert statuses == ["Searching ChanRobles", "Searching Lawphil"]
 
 
 @pytest.mark.asyncio
@@ -96,7 +130,7 @@ async def test_elibrary_fallback_is_used_when_lawphil_missing(tmp_path: Path) ->
             return httpx.Response(
                 200,
                 text=(
-                    "<html><body>G.R. NO. 145561. June 15, 2005"
+                    "<html><body>G.R. NO. 145561. June 15, 2005 Honda Philippines v. Samahan ng Malayang Manggagawa sa Honda DECISION "
                     '<a href="/assets/pdf/philrep/2005/GR145561.pdf">PDF</a></body></html>'
                 ),
                 request=request,
@@ -114,7 +148,7 @@ async def test_elibrary_fallback_is_used_when_lawphil_missing(tmp_path: Path) ->
     case = ParsedCase(
         1,
         "Week 2",
-        "Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda",
+        "Honda Philippines, Inc. v. Samahan ng Malayang Manggagawa sa Honda",
         "G.R. No. 145561",
         "2005-06-15",
         "",
@@ -129,7 +163,11 @@ async def test_elibrary_fallback_is_used_when_lawphil_missing(tmp_path: Path) ->
     await client.aclose()
     assert result.success
     assert result.source == "Supreme Court E-Library"
-    assert statuses == ["Searching Lawphil", "Searching E-Library"]
+    assert statuses == [
+        "Searching ChanRobles",
+        "Searching Lawphil",
+        "Searching E-Library",
+    ]
 
 
 @pytest.mark.asyncio
@@ -156,7 +194,7 @@ async def test_chanrobles_fallback_is_used_when_other_sources_are_missing(
         if url.endswith("2005junedecisions.php?id=596"):
             return httpx.Response(
                 200,
-                text="<html><body>G.R. No. 145561 : June 15, 2005</body></html>",
+                text="<html><body>G.R. No. 145561 : June 15, 2005 Honda Philippines v. Samahan ng Malayang Manggagawa sa Honda DECISION </body></html>",
                 request=request,
             )
         return httpx.Response(404, request=request)
@@ -165,7 +203,7 @@ async def test_chanrobles_fallback_is_used_when_other_sources_are_missing(
     case = ParsedCase(
         1,
         "Week 2",
-        "Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda",
+        "Honda Philippines, Inc. v. Samahan ng Malayang Manggagawa sa Honda",
         "G.R. No. 145561",
         "2005-06-15",
         "",
@@ -185,11 +223,7 @@ async def test_chanrobles_fallback_is_used_when_other_sources_are_missing(
     assert result.success
     assert result.source == "ChanRobles"
     assert result.source_url.endswith("2005junedecisions.php?id=596")
-    assert statuses == [
-        "Searching Lawphil",
-        "Searching E-Library",
-        "Searching ChanRobles",
-    ]
+    assert statuses == ["Searching ChanRobles"]
 
 
 @pytest.mark.asyncio
@@ -217,7 +251,7 @@ async def test_browser_is_used_when_chanrobles_rejects_plain_http(
 
 
 @pytest.mark.asyncio
-async def test_verified_supreme_court_pdf_is_saved_directly(tmp_path: Path) -> None:
+async def test_supreme_court_is_not_a_fourth_download_source(tmp_path: Path) -> None:
     pdf = blank_pdf()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -248,10 +282,9 @@ async def test_verified_supreme_court_pdf_is_saved_directly(tmp_path: Path) -> N
     async with CaseRetriever(client) as retriever:
         result = await retriever.retrieve(case, target, status)
     await client.aclose()
-    assert result.success
-    assert result.source == "Supreme Court"
-    assert result.source_url == source_url
-    assert target.read_bytes().startswith(b"%PDF")
+    assert not result.success
+    assert result.source != "Supreme Court"
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
@@ -259,7 +292,7 @@ async def test_lawphil_render_removes_cookie_notice(tmp_path: Path) -> None:
     case = ParsedCase(
         1,
         "Week 2",
-        "Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda",
+        "Honda Philippines, Inc. v. Samahan ng Malayang Manggagawa sa Honda",
         "G.R. No. 145561",
         "2005-06-15",
         "",

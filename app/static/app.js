@@ -489,7 +489,7 @@ function renderRun(run) {
       : `Run ${run.status.toLowerCase()}`
     : "Downloading cases";
   $("#run-subtitle").textContent = terminal
-    ? `${counts.saved + counts.existing} of ${counts.total} cases are available in the destination folder.`
+    ? `${run.verified_count || 0} of ${counts.total} cases verified; ${counts.saved + counts.existing} files available in the destination folder.`
     : "Checking official sources, then Google for unresolved cases.";
   $("#cancel-button").classList.toggle("hidden", terminal);
   $("#retry-button").classList.toggle("hidden", !terminal || counts.failed === 0);
@@ -522,6 +522,12 @@ function renderRun(run) {
     else if (item.source) addText(detail, item.source);
     else if (activeCaseStatuses.has(item.status)) addText(detail, "Working...");
     else addText(detail, "Waiting");
+    if (item.verification?.message) addText(detail, item.verification.message);
+    const identityProof = item.verification?.identity_verification;
+    if (identityProof?.reporter_page_verified === false) {
+      addText(detail, "Identity confirmed by independent sources; exact reporter page unavailable.");
+    }
+    if (item.failure_stage) addText(detail, `Stage: ${item.failure_stage}`);
     if (item.source_url) {
       const link = document.createElement("a");
       link.href = item.source_url;
@@ -571,7 +577,7 @@ function renderRun(run) {
         const choose = document.createElement("button");
         choose.type = "button";
         choose.className = "button outline small";
-        choose.textContent = "Use this match";
+        choose.textContent = "Verify this match";
         choose.addEventListener("click", () => selectCandidate(item.id, candidate.id, choose));
         option.append(copy, choose);
         list.appendChild(option);
@@ -643,7 +649,7 @@ async function selectCandidate(caseId, candidateId, button) {
     beginPolling();
   } catch (error) {
     button.disabled = false;
-    button.textContent = "Use this match";
+    button.textContent = "Verify this match";
     showAlert(error.message);
   }
 }

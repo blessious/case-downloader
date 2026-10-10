@@ -9,7 +9,7 @@ A local, cross-platform web application that turns assigned Philippine case list
 - Recognize numbered, bulleted, and unnumbered cases, including day-first dates and SCRA/Phil citations.
 - Search progressively by G.R./L-number, SCRA/Phil citation, party names, date, and the original syllabus entry.
 - Use Google only for cases unresolved by official-source lookup, with at most three browser searches per case.
-- Present uncertain verified matches as compact choices instead of prematurely marking them not found.
+- Keep uncertain matches in review; selecting a candidate requests verification and cannot override it.
 - Review the original syllabus entries in a compact list before starting.
 - Choose an absolute destination path on Windows or macOS.
 - Save title-only filenames inside week, module, or section folders.
@@ -96,4 +96,16 @@ Honda Philippines, Inc. v. Samahan ng Malalaya sa Honda.pdf
 
 ## Privacy and website access
 
-Run history stays in the current user’s application-data directory. Google receives search queries only for unresolved cases. Final documents are accepted only from Lawphil, the Supreme Court E-Library, the Supreme Court website, and ChanRobles. Other results may supply clues but are never saved. Google searches are serialized and CAPTCHA is never bypassed; when Google blocks automation, the app offers the same search for the user to open manually.
+Run history stays in the current user’s application-data directory. Google receives search queries only for unresolved cases. Final documents are accepted only from ChanRobles, Lawphil, and the Supreme Court E-Library, in that download fallback order. Other results may supply clues but are never saved. Google searches are serialized and CAPTCHA is never bypassed; when Google blocks automation, the app offers the same search for the user to open manually.
+
+## Strict identity verification
+
+Downloads always attempt **ChanRobles → Lawphil → Supreme Court E-Library**, stopping only at a verified PDF. A selected URL is tried during its source's turn; there is no fourth download source.
+
+Automatic matching uses the original docket and decision date, or an exact SCRA/Phil citation with both party sides and a source-confirmed docket and date. When the exact reporter page is unpublished, two independent approved sources must confirm the same docket, date, and both party sides, and a fresh Lawphil index must confirm the supplied reporter volume. This method explicitly records that the reporter page was not verified. Conflicting citations, dates, dockets, or party names remain in review. Scores rank candidates but never authorize saving. Source headings and structured index records establish identity; search snippets, cited cases, and cached metadata do not.
+
+Every final PDF must contain the verified docket, date, and matching party sides in its own decision heading. Index rows cannot establish identity. PDFs without extractable identity remain unresolved; verified HTML rendering is attempted before abandoning that source. Existing files are preserved and revalidated. No OCR or manual verification override is included.
+
+Run responses retain original identifiers, versioned verification evidence, failure stage, and a verified count. Historical runs retain their historical results without a new verification claim. Transient requests retry up to three times; blocked Google searches do not prevent direct-source discovery. The app does not promise a particular coverage percentage.
+
+Discovery searches distinctive party phrases and words as well as full captions and identifiers. Loose index matches only trigger a source fetch; the decision heading must still pass strict verification. E-Library's HTTP result links are upgraded to HTTPS. Windows requests use native certificate-chain validation, including intermediate certificate retrieval, without disabling HTTPS verification. SEC as a party expands to Securities and Exchange Commission; DENR Sec. still expands to Secretary. Dela/De La spacing is normalized. Consolidated docket shorthand is preserved and expanded so every requested docket must be present.

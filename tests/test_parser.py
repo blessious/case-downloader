@@ -8,6 +8,17 @@ from docx import Document
 from app.parser import extract_docx_text, parse_page_range, parse_text
 
 
+def test_gray_surname_is_not_a_docket_prefix():
+    case = parse_text("M.E. Gray vs. Insular Lumber (67 Phil 139)")[0]
+    assert case.title == "M.E. Gray v. Insular Lumber"
+    assert case.docket == ""
+
+
+def test_consolidated_space_separated_and_shorthand_dockets_preserved():
+    case = parse_text("Lu Ym v. Lu Ym, G.R. Nos. 219902 219903 & 219943-44, 17 January 2018")[0]
+    assert case.docket == "G.R. Nos. 219902 219903 & 219943-44"
+
+
 SAMPLE = """ASSIGNED CASES
 
 WEEK 2

@@ -4,7 +4,6 @@ import asyncio
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
-from difflib import SequenceMatcher
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
@@ -14,8 +13,9 @@ from playwright.async_api import Browser, BrowserContext, Playwright, async_play
 
 from .domain import ParsedCase
 from .filenames import normalize_case_title
-from .network import trusted_ssl_context
+from .network import trusted_ssl_context, source_request
 from .parser import DATE_RE, REPORTER_RE, docket_tokens, parse_date
+from .verification import heading_identity, verify_identity, title_matches, docket_ids, normalize_party, party_sides, DOCKET_RE, reporter_ids, VERIFIER_VERSION
 
 if TYPE_CHECKING:
     from .database import Database
@@ -27,8 +27,6 @@ APPROVED_SOURCE_HOSTS = {
     "lawphil.net": "Lawphil",
     "www.lawphil.net": "Lawphil",
     "elibrary.judiciary.gov.ph": "Supreme Court E-Library",
-    "sc.judiciary.gov.ph": "Supreme Court",
-    "www.sc.judiciary.gov.ph": "Supreme Court",
     "chanrobles.com": "ChanRobles",
     "www.chanrobles.com": "ChanRobles",
 }
@@ -52,6 +50,7 @@ class CaseCandidate:
     score: float = 0
     reasons: list[str] = field(default_factory=list)
     verified: bool = False
+    verification: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -151,46 +150,54 @@ def _party_tokens(value: str) -> set[str]:
 
 
 def _title_matches(expected: str, actual: str) -> bool:
-    left = _compact_title(expected)
-    right = _compact_title(actual)
-    if not left or not right:
-        return False
-    if left == right or left in right or right in left or SequenceMatcher(None, left, right).ratio() >= 0.78:
-        return True
-    expected_sides = re.split(r"\s+v\s+", left, maxsplit=1)
-    actual_sides = re.split(r"\s+v\s+", right, maxsplit=1)
-    if len(expected_sides) != 2 or len(actual_sides) != 2:
-        return False
-    expected_left, expected_right = map(_party_tokens, expected_sides)
-    actual_left, actual_right = map(_party_tokens, actual_sides)
-    return bool(
-        expected_left and expected_right
-        and expected_left.intersection(actual_left)
-        and expected_right.intersection(actual_right)
-    )
+    return title_matches(expected, actual)
 
 
 def _party_sides_found(title: str, evidence: str) -> bool:
-    sides = re.split(r"\s+v\s+", _compact_title(title), maxsplit=1)
-    if len(sides) != 2:
-        return False
-    evidence_tokens = set(_compact_title(evidence).split())
-    left, right = map(_party_tokens, sides)
-    return bool(
-        left and right
-        and left.intersection(evidence_tokens)
-        and right.intersection(evidence_tokens)
-    )
+    return title_matches(title, heading_identity(evidence)["title"])
 
 
 def _title_search_query(title: str) -> str:
-    tokens = _party_tokens(title)
-    return " ".join(token for token in _compact_title(title).split() if token in tokens)
+    return " ".join(normalize_party(title))
+
+
+def _party_search_queries(title: str) -> list[str]:
+    """Search contiguous party phrases, retaining punctuation used by source indexes.
+
+    A full normalized caption is often absent from an index whose caption includes
+    additional parties. These queries discover candidates only; they confer no proof.
+    """
+    sides = re.split(r"\b(?:versus\s+|vs?\.\s*|vs?\s+)", title, maxsplit=1, flags=re.I)
+    if len(sides) != 2:
+        return []
+    queries = []
+    for side in sides:
+        phrase = side.strip(" ,.;")
+        if len(normalize_party(phrase)) >= 2:
+            queries.append(phrase)
+            normalized = " ".join(normalize_party(phrase))
+            if normalized.casefold() != phrase.casefold():
+                queries.append(normalized)
+        # A distinctive surname or business word also finds captions with
+        # intervening qualifiers. Common institutional words are too broad.
+        broad = {"court", "appeals", "commission", "national", "government",
+                 "republic", "philippine", "philippines", "international",
+                 "department", "labor", "relations", "first", "instance"}
+        broad.update({"enterprises", "industries", "management", "services"})
+        tokens = [t for t in normalize_party(phrase) if len(t) >= 5 and t not in broad]
+        queries.extend(sorted(tokens, key=len, reverse=True)[:1])
+    return list(dict.fromkeys(queries))
+
+
+def _plausible_party_hint(expected: str, actual: str) -> bool:
+    """Loose index filtering only; the fetched heading must still pass verification."""
+    left, right = party_sides(expected), party_sides(actual)
+    return bool(left and right and all(set(a).intersection(b) for a, b in zip(left, right)))
 
 
 def _reporter_keys(value: str) -> set[tuple[str, str, str]]:
     return {
-        (match.group(1), match.group(2).casefold().rstrip("."), match.group(3))
+        (str(int(match.group(1))), match.group(2).casefold().rstrip("."), str(int(match.group(3))))
         for match in re.finditer(
             r"\b(\d{1,4})\s*(SCRA|PHIL\.?)\s*(\d{1,4})\b",
             value,
@@ -202,6 +209,11 @@ def _reporter_keys(value: str) -> set[tuple[str, str, str]]:
 def _reporter_matches(expected: str, actual: str) -> bool:
     expected_keys = _reporter_keys(expected)
     return bool(expected_keys and expected_keys.intersection(_reporter_keys(actual)))
+
+
+def _reporter_volume_keys(value: str) -> set[tuple[str, str]]:
+    return {(str(int(n)), kind.upper().rstrip(".")) for n, kind in
+            re.findall(r"\b(\d{1,4})\s*(SCRA|PHIL\.?)\b", value, re.I)}
 
 
 def _normalized_clue(value: str) -> str:
@@ -330,25 +342,75 @@ def _score_candidate(
 
 
 def candidates_are_ambiguous(candidates: list[CaseCandidate]) -> bool:
-    if len(candidates) < 2:
-        return False
-    first, second = candidates[:2]
-    return bool(
-        first.verified and second.verified
-        and first.source_url != second.source_url
-        and first.score - second.score <= 12
-    )
+    identities = {(tuple(sorted(docket_ids(c.docket))), c.decision_date)
+                  for c in candidates if candidate_is_high_confidence(c)}
+    return len(identities) > 1
 
 
 def candidate_is_high_confidence(candidate: CaseCandidate) -> bool:
-    return bool(
-        candidate.verified
-        and candidate.score >= 70
-        and (
-            "Exact docket number" in candidate.reasons
-            or "Both case sides matched" in candidate.reasons
-        )
-    )
+    return bool(candidate.verified and candidate.verification.get("outcome") == "verified")
+
+
+def verify_concordant_mirrors(case: ParsedCase, candidates: list[CaseCandidate]) -> None:
+    """Recover missing reporter pages through fresh, independent source headings.
+
+    This cannot rescue a conflicting identifier or party name. A fresh structured
+    index must establish the requested reporter volume; a missing page remains
+    explicitly disclosed in the evidence rather than being invented.
+    """
+    wanted = reporter_ids(case.reporter_citation)
+    if not wanted:
+        return
+    groups: dict[tuple, list[CaseCandidate]] = {}
+    for candidate in candidates:
+        proof = candidate.verification
+        actual = proof.get("actual_identity", {})
+        if not actual or not docket_ids(actual.get("docket", "")) or not actual.get("decision_date"):
+            continue
+        key = (tuple(sorted(docket_ids(actual["docket"]))), actual["decision_date"])
+        groups.setdefault(key, []).append(candidate)
+    for mirrors in groups.values():
+        usable = []
+        volumes = set()
+        conflict = False
+        for candidate in mirrors:
+            proof = candidate.verification
+            actual = proof["actual_identity"]
+            if proof.get("outcome") == "conflicting_evidence":
+                conflict = True
+                break
+            found = {item for item in reporter_ids(actual.get("reporter_citation", ""))
+                     if item[1] in {expected[1] for expected in wanted}}
+            if found and not wanted.issubset(found):
+                conflict = True
+                break
+            # Substitute only the absent citation requirement, never supplied
+            # docket/date/parties, then verify the full fetched heading.
+            expected = {"title": case.title, "docket": case.docket or actual["docket"],
+                        "decision_date": case.decision_date or actual["decision_date"]}
+            if not verify_identity(expected, actual, candidate.source_url).verified:
+                continue
+            usable.append(candidate)
+            reference = proof.get("source_reference", {})
+            if reference.get("source") == "Lawphil":
+                volumes.update(_reporter_volume_keys(reference.get("reporter_citation", "")))
+        required_volumes = {(n, kind) for n, kind, _page in wanted}
+        if conflict or len({c.source for c in usable}) < 2 or not required_volumes.issubset(volumes):
+            continue
+        evidence = [{"source": c.source, "source_url": c.source_url,
+                     "identity": c.verification["actual_identity"]} for c in usable]
+        references = [c.verification["source_reference"] for c in usable if c.verification.get("source_reference")]
+        for candidate in usable:
+            candidate.verification.update(
+                outcome="verified", verifier_version=VERIFIER_VERSION,
+                message="Case identity independently confirmed by two approved sources; exact reporter page unavailable",
+                verification_method="concordant_source_headings",
+                reporter_page_verified=False, mirror_evidence=evidence, source_references=references,
+                evidence=["Same exact docket and decision date in independent source headings",
+                          "Both supplied party sides match each source heading",
+                          f"Fresh structured source index confirms reporter volume: {case.reporter_citation}",
+                          "Exact reporter page is unavailable; no conflicting citation found"])
+            candidate.verified = True
 
 
 class CaseResolver:
@@ -385,16 +447,20 @@ class CaseResolver:
             await self.client.aclose()
 
     async def _search_lawphil(self, query: str) -> list[CaseCandidate]:
-        response = await self.client.get(
-            LAWPHIL_SEARCH_URL,
-            params={"rows": 25, "sort": "newest", "search": query, "page": 1},
-        )
-        response.raise_for_status()
-        payload = response.json()
         unique: dict[str, CaseCandidate] = {}
-        for row in payload.get("data", []):
-            candidate = _candidate_from_lawphil(row)
-            unique[candidate.source_url] = candidate
+        for page in range(1, 5):
+            response = await source_request(self.client, "GET", LAWPHIL_SEARCH_URL,
+                params={"rows": 25, "sort": "newest", "search": query, "page": page})
+            response.raise_for_status()
+            rows = response.json().get("data", [])
+            added = 0
+            for row in rows:
+                candidate = _candidate_from_lawphil(row)
+                if candidate.source_url not in unique:
+                    added += 1
+                unique[candidate.source_url] = candidate
+            if len(rows) < 25 or not added:
+                break
         return list(unique.values())
 
     async def _ensure_google_context(self) -> BrowserContext:
@@ -502,64 +568,201 @@ class CaseResolver:
             if page_fetcher:
                 html, resolved_url = await page_fetcher(source, result["url"])
             else:
-                response = await self.client.get(result["url"])
+                response = await source_request(self.client, "GET", result["url"])
                 response.raise_for_status()
                 html, resolved_url = response.text, str(response.url)
         except Exception:
             return None
         if not _source_for_url(resolved_url):
             return None
-        soup = BeautifulSoup(html, "html.parser")
-        page_text = soup.get_text(" ", strip=True)[:30_000]
-        combined = f"{result['title']} {result['description']} {page_text}"
-        docket = _extract_docket(page_text)
-        expected_tokens = docket_tokens(case.docket)
-        if expected_tokens and expected_tokens[0] in docket_tokens(page_text):
-            docket = case.docket
-        reporter = _extract_reporter(combined)
-        if case.reporter_citation and _normalized_clue(case.reporter_citation) in _normalized_clue(combined):
-            reporter = case.reporter_citation
+        actual = heading_identity(html)
         candidate = CaseCandidate(
-            title=result["title"] if " v" in result["title"].casefold() else case.title,
-            docket=docket,
-            decision_date=_extract_date(page_text),
-            reporter_citation=reporter,
-            source=_source_for_url(resolved_url),
-            source_url=resolved_url,
-            verified=True,
+            title=actual["title"], docket=actual["docket"],
+            decision_date=actual["decision_date"], reporter_citation=actual["reporter_citation"],
+            source=_source_for_url(resolved_url), source_url=resolved_url,
         )
-        return _score_candidate(
-            case, candidate, combined, exact_query_kind=query_kind
-        )
+        verification = verify_identity(case, actual, resolved_url)
+        candidate.verification = verification.as_dict()
+        candidate.verified = verification.verified
+        # Scores are discovery/ranking hints only; verification is a separate gate.
+        scored = _score_candidate(case, candidate, actual["heading"], exact_query_kind=query_kind)
+        return scored or candidate
+
+    async def verify_candidate(self, case: ParsedCase, candidate: CaseCandidate,
+                               page_fetcher: PageFetcher | None = None) -> CaseCandidate:
+        fresh = await self._candidate_from_web_result(case,
+            {"url": candidate.source_url, "title": "", "description": ""}, "", page_fetcher)
+        if candidate.source == "Lawphil" and (fresh is None or not fresh.docket):
+            # Legacy Lawphil filenames use both gr_l-N and gr_l_N. A broken
+            # index URL is a hint, not a reason to abandon the same decision.
+            alternates = [re.sub(r"/gr_l([-_])", lambda m: "/gr_l" + ("_" if m.group(1) == "-" else "-"), candidate.source_url, flags=re.I),
+                          re.sub(r"/gr_l[-_]", "/gr_", candidate.source_url, flags=re.I)]
+            for alternate in dict.fromkeys(alternates):
+                if alternate == candidate.source_url:
+                    continue
+                repaired = await self._candidate_from_web_result(case,
+                    {"url": alternate, "title": "", "description": ""}, "", page_fetcher)
+                if repaired and repaired.docket:
+                    fresh = repaired
+                    break
+        if fresh is None:
+            candidate.verified = False
+            candidate.verification = {"outcome": "insufficient_evidence", "message": "Source could not be fetched for verification"}
+            return candidate
+        # An explicit reporter reference in the source's structured index may
+        # establish citation; snippets and cached metadata may never do so.
+        if candidate.source == "Lawphil" and candidate.reporter_citation:
+            actual = {"title": fresh.title, "docket": fresh.docket,
+                      "decision_date": fresh.decision_date,
+                      "reporter_citation": fresh.reporter_citation or candidate.reporter_citation}
+            same_docket = docket_ids(candidate.docket) == docket_ids(fresh.docket)
+            linked_prefix_discrepancy = (
+                not case.docket and candidate.source == fresh.source
+                and bool(docket_ids(candidate.docket) and docket_ids(fresh.docket))
+                and {d.removeprefix("L-") for d in docket_ids(candidate.docket)}
+                    == {d.removeprefix("L-") for d in docket_ids(fresh.docket)})
+            same_identity = ((same_docket or linked_prefix_discrepancy)
+                             and candidate.decision_date == fresh.decision_date
+                             and title_matches(candidate.title, fresh.title))
+            if same_identity:
+                result = verify_identity(case, actual, fresh.source_url)
+                fresh.verification = result.as_dict()
+                fresh.verification["source_reference"] = {
+                    "source": "Lawphil", "source_url": candidate.source_url,
+                    "reporter_citation": candidate.reporter_citation,
+                    "docket": candidate.docket, "decision_date": candidate.decision_date}
+                if not same_docket:
+                    fresh.verification["source_reference"]["index_docket_discrepancy"] = {
+                        "index": candidate.docket, "decision_heading": fresh.docket}
+                fresh.verified = result.verified
+                fresh.reporter_citation = actual["reporter_citation"]
+        return fresh
+
+    async def _direct_discovery(self, case: ParsedCase, seeds: list[CaseCandidate],
+                                page_fetcher: PageFetcher | None) -> list[CaseCandidate]:
+        from .retrieval import ELIBRARY_SEARCH_URL, ELIBRARY_INDEX, _normalize_url
+        found: dict[str, CaseCandidate] = {}
+        docket_hints = [docket_ids(case.docket)] if case.docket else [docket_ids(c.docket) for c in seeds]
+        docket_hints = [ids for ids in docket_hints if ids]
+        queries = list(dict.fromkeys(q for q in (case.docket, case.reporter_citation, case.title) if q))
+        for query in queries:
+            try:
+                response = await source_request(self.client, "POST", ELIBRARY_SEARCH_URL, data={
+                    "cmd": "search", "request": query, "searchType": "phrase",
+                    "index": ELIBRARY_INDEX, "sort": "Hits", "pageSize": "25"})
+                response.raise_for_status()
+                seen_pages: set[str] = set()
+                for _page in range(4):
+                    page_url = str(response.url)
+                    if page_url in seen_pages:
+                        break
+                    seen_pages.add(page_url)
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    for link in soup.select("a.file_link[href]")[:25]:
+                        label = link.get_text(" ", strip=True)
+                        leading_docket = DOCKET_RE.search(label)
+                        if docket_hints and leading_docket:
+                            # Search snippets can quote the target inside a different
+                            # decision. Fetch the result's own docket, not that quote.
+                            result_ids = docket_ids(leading_docket.group())
+                            if not any(ids.issubset(result_ids) for ids in docket_hints):
+                                continue
+                        url = _normalize_url(str(link["href"]), page_url)
+                        if url in found:
+                            continue
+                        candidate = await self._candidate_from_web_result(case,
+                            {"url": url, "title": "", "description": ""}, "", page_fetcher)
+                        if candidate:
+                            found[url] = candidate
+                    next_link = next((a for a in soup.select("a[href]")
+                        if "next" in a.get("rel", []) or re.fullmatch(r"next(?:\s*(?:page|>|»))*", a.get_text(" ", strip=True), re.I)), None)
+                    if not next_link or _page == 3:
+                        break
+                    next_url = _normalize_url(str(next_link["href"]), page_url)
+                    if urlparse(next_url).hostname != "elibrary.judiciary.gov.ph" or urlparse(next_url).scheme != "https":
+                        break
+                    response = await source_request(self.client, "GET", next_url)
+
+            except (httpx.HTTPError, ValueError):
+                continue
+        dates = {c.decision_date for c in seeds if c.decision_date}
+        if case.decision_date:
+            dates.add(case.decision_date)
+        for date in sorted(dates)[:4]:
+            year, month = date[:4], int(date[5:7])
+            url = f"https://chanrobles.com/cralaw/{year}decisions.php?id={month}"
+            try:
+                if page_fetcher:
+                    html, base = await page_fetcher("ChanRobles", url)
+                else:
+                    response = await source_request(self.client, "GET", url)
+                    response.raise_for_status()
+                    html, base = response.text, str(response.url)
+                soup = BeautifulSoup(html, "html.parser")
+                for link in soup.select("a[href]"):
+                    label = link.get_text(" ", strip=True)
+                    if not (_title_matches(case.title, label) or (docket_ids(case.docket) and docket_ids(case.docket).issubset(docket_ids(label)))):
+                        continue
+                    target = urljoin(base, str(link["href"]))
+                    if target in found:
+                        continue
+                    candidate = await self._candidate_from_web_result(case,
+                        {"url": target, "title": "", "description": ""}, "", page_fetcher)
+                    if candidate:
+                        found[target] = candidate
+                    if len(found) >= 100:
+                        break
+            except (httpx.HTTPError, ValueError):
+                continue
+        return list(found.values())
 
     async def candidates(
         self, case: ParsedCase, page_fetcher: PageFetcher | None = None
     ) -> list[CaseCandidate]:
-        if self.database:
-            cached = self.database.get_cached_candidates(lookup_keys(case))
-            if cached:
-                candidates = [CaseCandidate(**item) for item in cached]
-                return sorted(candidates, key=lambda item: item.score, reverse=True)
-
         official: dict[str, CaseCandidate] = {}
-        # Strong identifiers first, then the looser party-name lookup.
-        queries = [case.docket, case.reporter_citation, _title_search_query(case.title)]
+        # Cache entries are hints; fetch and verify without trusting cached evidence.
+        if self.database:
+            for hint in self.database.get_cached_candidates(lookup_keys(case)):
+                candidate = await self._candidate_from_web_result(case,
+                    {"url": hint["source_url"], "title": "", "description": ""}, "", page_fetcher)
+                if candidate:
+                    official[candidate.source_url] = candidate
+        volume_query = re.search(r"\b\d{1,4}\s*(?:SCRA|PHIL\.?)\b", case.reporter_citation, re.I)
+        queries = [case.docket, case.reporter_citation, volume_query.group() if volume_query else "", _title_search_query(case.title),
+                   *_party_search_queries(case.title)]
+        seeds: list[CaseCandidate] = []
+        checked_official: set[str] = set()
         for query in dict.fromkeys(value.strip() for value in queries if value.strip()):
             try:
                 found = await self._search_lawphil(query)
             except (httpx.HTTPError, ValueError):
-                # A temporary official-index failure must not prevent the
-                # browser discovery fallback from finding the same decision.
                 found = []
             for candidate in found:
-                scored = _score_candidate(case, candidate, candidate.title)
-                if scored:
-                    official[scored.source_url] = scored
-            if official:
-                ranked = sorted(official.values(), key=lambda item: item.score, reverse=True)
-                if candidate_is_high_confidence(ranked[0]) and not candidates_are_ambiguous(ranked):
-                    return ranked
-
+                if candidate.source_url in checked_official:
+                    continue
+                if docket_ids(case.docket) and not docket_ids(case.docket).issubset(docket_ids(candidate.docket)):
+                    continue
+                if volume_query:
+                    wanted_volumes = _reporter_volume_keys(case.reporter_citation)
+                    comparable = {item for item in _reporter_volume_keys(candidate.reporter_citation)
+                                  if item[1] in {kind for _n, kind in wanted_volumes}}
+                    if comparable and not wanted_volumes.issubset(comparable):
+                        continue
+                if not (_plausible_party_hint(case.title, candidate.title)
+                        or (case.reporter_citation and _reporter_matches(case.reporter_citation, candidate.reporter_citation))
+                        or docket_ids(case.docket)):
+                    continue
+                checked_official.add(candidate.source_url)
+                seeds.append(candidate)
+                fresh = await self.verify_candidate(case, candidate, page_fetcher)
+                official[fresh.source_url] = fresh
+        if any(candidate_is_high_confidence(c) for c in official.values()) and not candidates_are_ambiguous(list(official.values())):
+            return sorted(official.values(), key=lambda c: (candidate_is_high_confidence(c), c.score), reverse=True)
+        for candidate in await self._direct_discovery(case, seeds, page_fetcher):
+            official[candidate.source_url] = candidate
+        verify_concordant_mirrors(case, list(official.values()))
+        if any(candidate_is_high_confidence(c) for c in official.values()) and not candidates_are_ambiguous(list(official.values())):
+            return sorted(official.values(), key=lambda c: (candidate_is_high_confidence(c), c.score), reverse=True)
         web_candidates: dict[str, CaseCandidate] = dict(official)
         web_queries = self._web_queries(case)
         for query_kind, query in web_queries:
@@ -567,7 +770,7 @@ class CaseResolver:
                 results = await self._search_google(query)
             except GoogleSearchBlocked as exc:
                 exc.candidates = sorted(
-                    web_candidates.values(), key=lambda item: item.score, reverse=True
+                    web_candidates.values(), key=lambda item: (candidate_is_high_confidence(item), item.score), reverse=True
                 )
                 raise
             for result in results:
@@ -589,16 +792,16 @@ class CaseResolver:
                     except (httpx.HTTPError, ValueError):
                         discovered = []
                     for lawphil_candidate in discovered:
-                        scored = _score_candidate(case, lawphil_candidate, clue_text)
-                        if scored:
-                            web_candidates[scored.source_url] = scored
-            ranked = sorted(web_candidates.values(), key=lambda item: item.score, reverse=True)
+                        fresh = await self.verify_candidate(case, lawphil_candidate, page_fetcher)
+                        web_candidates[fresh.source_url] = fresh
+            verify_concordant_mirrors(case, list(web_candidates.values()))
+            ranked = sorted(web_candidates.values(), key=lambda item: (candidate_is_high_confidence(item), item.score), reverse=True)
             if ranked and candidate_is_high_confidence(ranked[0]) and not candidates_are_ambiguous(ranked):
                 return ranked
-        return sorted(web_candidates.values(), key=lambda item: item.score, reverse=True)
+        return sorted(web_candidates.values(), key=lambda item: (candidate_is_high_confidence(item), item.score), reverse=True)
 
     def cache_verified(self, case: ParsedCase, candidate: CaseCandidate) -> None:
-        if not self.database:
+        if not self.database or not candidate_is_high_confidence(candidate):
             return
         cached = candidate.as_dict()
         cached["verified"] = True
@@ -609,19 +812,9 @@ def apply_resolution(case_data: dict[str, Any], candidates: list[CaseCandidate])
     result = dict(case_data)
     result["candidates"] = [candidate.as_dict() for candidate in candidates]
     result["resolution_status"] = "ready" if result.get("docket") and result.get("decision_date") else "unresolved"
-    legacy_match = False
-    if len(candidates) == 1 and candidates[0].score == 0:
-        candidate = candidates[0]
-        legacy_match = bool(
-            (
-                result.get("docket")
-                and docket_tokens(result["docket"]) == docket_tokens(candidate.docket)
-            )
-            or _title_matches(result.get("title", ""), candidate.title)
-        )
-    if len(candidates) == 1 and (
-        candidate_is_high_confidence(candidates[0]) or legacy_match
-    ):
+    if not result.get("original_input"):
+        result["original_input"] = {key: result.get(key, "") for key in ("title", "docket", "decision_date", "reporter_citation")}
+    if candidates and candidate_is_high_confidence(candidates[0]) and not candidates_are_ambiguous(candidates):
         candidate = candidates[0]
         result["docket"] = result.get("docket") or candidate.docket
         result["decision_date"] = result.get("decision_date") or candidate.decision_date

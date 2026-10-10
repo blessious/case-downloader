@@ -48,6 +48,7 @@ def _parsed_response(text: str) -> dict[str, object]:
     rows = []
     for item in parsed:
         data = item.as_dict()
+        data["original_input"] = {key: getattr(item, key) for key in ("title", "docket", "decision_date", "reporter_citation")}
         filename, filename_warnings = filename_for_title(item.title)
         data["filename"] = filename
         data["warnings"] = item.warnings + filename_warnings

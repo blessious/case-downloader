@@ -18,6 +18,7 @@ class ParsedCase:
     reporter_citation: str = ""
     metadata_source: str = ""
     metadata_source_url: str = ""
+    original_input: dict[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -45,6 +46,7 @@ class RetrievalResult:
     error_message: str = ""
     attempts: list[RetrievalAttempt] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    verification: dict[str, Any] = field(default_factory=dict)
 
 
 FINAL_STATUSES = {

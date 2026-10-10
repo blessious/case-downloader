@@ -30,12 +30,12 @@ SECTION_RE = re.compile(
 LIST_PREFIX_RE = re.compile(r"^\s*(?:\d+[\.\)]|[-\u2022])\s+")
 CASE_TITLE_RE = re.compile(r"(?<!\w)(?:v(?:s)?\.?|versus)(?!\w)", re.IGNORECASE)
 DOCKET_START_RE = re.compile(
-    r"(?<![A-Za-z])(?:G\.?\s*R\.?(?:\s*R\.?)?\s*(?:(?:Nos?\.?)|#)?|L-?\s*(?=\d{3,}))\s*",
+    r"(?<![A-Za-z])(?:G\.?\s*R\.?(?:\s*R\.?)?\s*(?:(?:Nos?\.?)|#)?|L-?\s*(?=\d{3,}))\s*(?=[-:]?\s*(?:L\s*-?\s*)?\d{3,})",
     re.IGNORECASE,
 )
 DOCKET_VALUE_RE = re.compile(
     r"(?P<docket>(?:G\.?\s*R\.?(?:\s*R\.?)?\s*(?:(?:Nos?\.?)|#)?\s*[-:]?\s*)?"
-    r"(?:L\s*-?\s*)?\d{3,}(?:\s*(?:,|&|and|/)\s*(?:L\s*-?\s*)?\d{3,})*)",
+    r"(?:L\s*-?\s*)?\d{3,}(?:\s*-\s*\d{1,6})?(?:\s*(?:,|&|and|/|\s+(?=\d{5,}))\s*(?:L\s*-?\s*)?\d{3,}(?:\s*-\s*\d{1,6})?)*)",
     re.IGNORECASE,
 )
 REPORTER_RE = re.compile(

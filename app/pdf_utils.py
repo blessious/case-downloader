@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from pypdf import PdfReader
 
-from .parser import docket_tokens
+from .verification import VerificationResult, heading_identity, verify_identity
 
 
 @dataclass(slots=True)
@@ -16,9 +15,10 @@ class PdfValidation:
     error_code: str = ""
     error_message: str = ""
     warnings: list[str] = field(default_factory=list)
+    verification: VerificationResult = field(default_factory=VerificationResult)
 
 
-def validate_pdf(path: Path, docket: str = "", decision_date: str = "") -> PdfValidation:
+def validate_pdf(path: Path, docket: str = "", decision_date: str = "", title: str = "", source_url: str = "") -> PdfValidation:
     try:
         if not path.exists():
             return PdfValidation(False, error_code="PDF_MISSING", error_message="PDF file does not exist")
@@ -36,18 +36,16 @@ def validate_pdf(path: Path, docket: str = "", decision_date: str = "") -> PdfVa
                 extracted.append(page.extract_text() or "")
             except Exception:
                 continue
-        text = re.sub(r"\s+", "", " ".join(extracted)).upper()
-        warnings: list[str] = []
-        expected = docket_tokens(docket)
-        if text and expected and not any(token in text for token in expected):
-            return PdfValidation(
-                False,
-                page_count=len(reader.pages),
-                error_code="PDF_IDENTITY_MISMATCH",
-                error_message="PDF text does not contain the expected docket number",
-            )
-        if not text:
-            warnings.append("PDF has no extractable text; identity could not be verified automatically")
-        return PdfValidation(True, page_count=len(reader.pages), warnings=warnings)
+        text = " ".join(extracted)
+        verification = verify_identity(
+            {"docket": docket, "decision_date": decision_date, "title": title},
+            heading_identity(text), source_url,
+        )
+        if not verification.verified:
+            return PdfValidation(False, page_count=len(reader.pages),
+                error_code="PDF_IDENTITY_MISMATCH" if verification.outcome == "conflicting_evidence" else "PDF_IDENTITY_UNVERIFIED",
+                error_message=verification.message, verification=verification)
+        return PdfValidation(True, page_count=len(reader.pages), verification=verification)
+
     except Exception as exc:
         return PdfValidation(False, error_code="PDF_UNREADABLE", error_message=str(exc))

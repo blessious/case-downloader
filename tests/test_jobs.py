@@ -8,6 +8,7 @@ import pytest
 from app.database import Database
 from app.jobs import JobManager, resolve_output_dir
 from app.pdf_utils import PdfValidation
+from app.verification import VerificationResult
 from app.domain import RetrievalResult
 from app.resolver import CaseCandidate, GoogleSearchBlocked, google_search_url
 
@@ -137,7 +138,7 @@ async def test_missing_metadata_is_resolved_during_download(
     item = db.get_run(run_id)["cases"][0]
 
     class FakeResolver:
-        async def candidates(self, _case):
+        async def candidates(self, _case, _fetcher=None):
             return [
                 CaseCandidate(
                     "Mendiola v. Court of Appeals",
@@ -159,14 +160,14 @@ async def test_missing_metadata_is_resolved_during_download(
                 temp_path=str(output_path),
             )
 
-    monkeypatch.setattr("app.jobs.validate_pdf", lambda *_args: PdfValidation(True, 1))
+    monkeypatch.setattr("app.jobs.validate_pdf", lambda *_args: PdfValidation(True, 1, verification=VerificationResult(outcome="verified")))
     await manager._process_case(
         run_id, item, tmp_path / "output", FakeRetriever(), FakeResolver()
     )
     saved = db.get_run(run_id)["cases"][0]
-    assert saved["status"] == "Saved"
-    assert saved["docket"] == "G.R. No. 159333"
-    assert saved["decision_date"] == "2006-07-31"
+    assert saved["status"] == "Needs review"
+    assert saved["docket"] == ""
+    assert saved["original_input"]["docket"] == ""
 
 
 @pytest.mark.asyncio
@@ -186,7 +187,7 @@ async def test_blocked_google_search_becomes_review_with_manual_link(tmp_path: P
     item = db.get_run(run_id)["cases"][0]
 
     class BlockedResolver:
-        async def candidates(self, case):
+        async def candidates(self, case, _fetcher=None):
             query = case.raw_text or case.title
             raise GoogleSearchBlocked(
                 "Google paused automated searching. Open this search manually or retry later.",
@@ -224,7 +225,7 @@ async def test_uncertain_candidate_also_offers_manual_google_search(tmp_path: Pa
     item = db.get_run(run_id)["cases"][0]
 
     class UncertainResolver:
-        async def candidates(self, _case):
+        async def candidates(self, _case, _fetcher=None):
             return [
                 CaseCandidate(
                     "Makati Leasing v. Wearever Textile Mills",
@@ -271,7 +272,7 @@ async def test_complete_case_retries_verified_google_candidate_after_source_miss
     item = db.get_run(run_id)["cases"][0]
 
     class GoogleResolver:
-        async def candidates(self, _case):
+        async def candidates(self, _case, _fetcher=None):
             return [
                 CaseCandidate(
                     "Prudential Bank v. Judge Panis",
@@ -283,6 +284,7 @@ async def test_complete_case_retries_verified_google_candidate_after_source_miss
                         score=110,
                         reasons=["Exact docket number"],
                         verified=True,
+                        verification={"outcome": "verified", "evidence": ["Exact docket and date"]},
                 )
             ]
 
@@ -308,7 +310,7 @@ async def test_complete_case_retries_verified_google_candidate_after_source_miss
             )
 
     retriever = RetryRetriever()
-    monkeypatch.setattr("app.jobs.validate_pdf", lambda *_args: PdfValidation(True, 1))
+    monkeypatch.setattr("app.jobs.validate_pdf", lambda *_args: PdfValidation(True, 1, verification=VerificationResult(outcome="verified")))
     await manager._process_case(
         run_id, item, tmp_path / "output", retriever, GoogleResolver()
     )

@@ -2,6 +2,8 @@ name: Build Mac DMG
 
 on:
   workflow_dispatch:
+  push:
+    branches: [codex/macos-apple-silicon-package]
 
 permissions:
   contents: read
@@ -9,7 +11,7 @@ permissions:
 jobs:
   build-macos:
     name: Build Mac DMG
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 45
 
     steps:
@@ -22,16 +24,25 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
       - name: Build application and DMG
         run: |
           chmod +x scripts/build-macos.sh
           ./scripts/build-macos.sh
 
+      - name: Run verification tests
+        run: .venv/bin/python -m pytest -q --disable-warnings
+
+      - name: Smoke test packaged app and browser
+        run: .venv/bin/python scripts/smoke-macos.py
+
       - name: Upload Mac DMG
         uses: actions/upload-artifact@v7
         with:
-          name: Case-PDF-Downloader-macOS
-          path: dist/*.dmg
+          name: Case-PDF-Downloader-macOS-Apple-Silicon
+          path: dist/*-macOS-Apple-Silicon.dmg
           archive: false
           if-no-files-found: error
           retention-days: 14

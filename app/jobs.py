@@ -9,6 +9,8 @@ from typing import Any
 from .config import DOWNLOAD_CONCURRENCY
 from .database import Database
 from .domain import ParsedCase
+from .verification import VerificationResult
+from .parser import parse_text
 from .filenames import filename_for_title, path_too_long, safe_week_folder
 from .pdf_utils import validate_pdf
 from .retrieval import CaseRetriever
@@ -73,7 +75,7 @@ class JobManager:
             payload.get("input_source", "Pasted text"), str(output_dir), prepared
         )
 
-        seen: dict[tuple[str, str], tuple[str, str]] = {}
+        seen: dict[tuple[str, str], tuple[str, str, str]] = {}
         for item in prepared:
             if item.get("parse_error"):
                 self.database.update_case(
@@ -86,10 +88,11 @@ class JobManager:
             key = (safe_week_folder(item["week"]).casefold(), item["filename"].casefold())
             normalized_docket = "".join(char for char in item["docket"].upper() if char.isalnum())
             if key not in seen:
-                seen[key] = (item["id"], normalized_docket)
+                seen[key] = (normalized_docket, item.get("decision_date", ""), item.get("reporter_citation", "").casefold())
                 continue
-            _, first_docket = seen[key]
-            if first_docket == normalized_docket:
+            first_docket, first_date, first_citation = seen[key]
+            if (first_docket == normalized_docket and first_date == item.get("decision_date", "")
+                    and first_citation == item.get("reporter_citation", "").casefold()):
                 self.database.update_case(
                     item["id"],
                     status="Duplicate input",
@@ -137,9 +140,6 @@ class JobManager:
         self.database.update_case(
             case_id,
             status="Queued",
-            docket=candidate["docket"],
-            decision_date=candidate["decision_date"],
-            reporter_citation=candidate["reporter_citation"],
             metadata_source=candidate["source"],
             metadata_source_url=candidate["source_url"],
             error_code="",
@@ -167,347 +167,161 @@ class JobManager:
             )
 
     async def _process_case(
-        self,
-        run_id: str,
-        item: dict[str, Any],
-        output_dir: Path,
-        retriever: CaseRetriever,
-        resolver: CaseResolver,
+        self, run_id: str, item: dict[str, Any], output_dir: Path,
+        retriever: CaseRetriever, resolver: CaseResolver,
     ) -> None:
         case_id = item["id"]
-        selected_candidate: CaseCandidate | None = None
-        if (
-            not item.get("docket") or not item.get("decision_date")
-        ) and not item.get("metadata_source_url"):
+        original = item.get("original_input") or {}
+        if not original:
+            # Historical inferred metadata must never be promoted to original evidence.
+            parsed_rows = parse_text(item.get("raw_text", ""))
+            if parsed_rows:
+                original = parsed_rows[0].as_dict()
+            elif not item.get("metadata_source_url"):
+                original = item
+            else:
+                original = {"title": item["title"]}
+            original = {key: original.get(key, "") for key in ("title", "docket", "decision_date", "reporter_citation")}
+            self.database.update_case(case_id, original_input=original)
+        lookup = ParsedCase(item["ordinal"], item["week"], original.get("title", item["title"]),
+            original.get("docket", ""), original.get("decision_date", ""), item.get("raw_text", ""),
+            reporter_citation=original.get("reporter_citation", ""))
+        selected = None
+        needs_resolution = bool(not lookup.docket or not lookup.decision_date or lookup.reporter_citation or item.get("metadata_source_url"))
+        if needs_resolution:
             self.database.update_case(case_id, status="Searching case details")
-            lookup_case = ParsedCase(
-                ordinal=item["ordinal"],
-                week=item["week"],
-                title=item["title"],
-                docket=item.get("docket", ""),
-                decision_date=item.get("decision_date", ""),
-                raw_text=item.get("raw_text", ""),
-                reporter_citation=item.get("reporter_citation", ""),
-            )
             try:
-                self.database.update_case(case_id, status="Searching Google")
-                page_fetcher = getattr(retriever, "fetch_text", None)
-                try:
-                    candidates = await resolver.candidates(lookup_case, page_fetcher)
-                except TypeError:
-                    candidates = await resolver.candidates(lookup_case)
+                fetcher = getattr(retriever, "fetch_text", None)
+                candidates = await resolver.candidates(lookup, fetcher)
             except GoogleSearchBlocked as exc:
-                if exc.candidates:
-                    self.database.set_case_candidates(
-                        case_id, [candidate.as_dict() for candidate in exc.candidates[:5]]
-                    )
-                self.database.update_case(
-                    case_id,
-                    status="Needs review",
-                    error_code="GOOGLE_SEARCH_BLOCKED",
-                    error_message=str(exc),
-                    manual_search_url=exc.manual_search_url,
-                )
-                return
-            except WebSearchError as exc:
-                self.database.update_case(
-                    case_id,
-                    status="Needs review",
-                    error_code="GOOGLE_SEARCH_FAILED",
-                    error_message="Google search could not be completed. Retry later or search manually.",
-                    manual_search_url=google_search_url(item.get("raw_text") or item["title"]),
-                )
-                return
+                candidates = exc.candidates
+                if not any(candidate_is_high_confidence(c) for c in candidates):
+                    self.database.set_case_candidates(case_id, [c.as_dict() for c in candidates[:5]])
+                    evidence = (candidates[0].verification if candidates and candidates[0].verification
+                                else VerificationResult(message="No conclusive direct-source match; Google is unavailable").as_dict())
+                    self.database.update_case(case_id, status="Needs review", error_code="GOOGLE_SEARCH_BLOCKED",
+                        error_message=f"{evidence.get('message', 'Insufficient identity evidence')}. {exc}",
+                        manual_search_url=exc.manual_search_url, verification=evidence,
+                        failure_stage="identity" if candidates else "discovery")
+                    return
             except Exception as exc:
-                self.database.update_case(
-                    case_id,
-                    status="Not saved",
-                    error_code="METADATA_LOOKUP_FAILED",
-                    error_message=f"Could not search the case title: {exc}",
-                )
+                self.database.update_case(case_id, status="Needs review", error_code="METADATA_LOOKUP_FAILED",
+                    error_message=f"Could not verify case identity: {exc}", verification=VerificationResult().as_dict())
                 return
-            if not candidates:
-                self.database.update_case(
-                    case_id,
-                    status="Not saved",
-                    error_code="CASE_NOT_FOUND",
-                    error_message="No matching decision was found from the syllabus entry",
-                    manual_search_url="",
-                )
+            verified = [c for c in candidates if candidate_is_high_confidence(c)]
+            selected_url = item.get("metadata_source_url", "")
+            selected = (next((c for c in verified if c.source_url == selected_url), None)
+                        if selected_url else verified[0] if verified else None)
+            if not selected or candidates_are_ambiguous(candidates):
+                self.database.set_case_candidates(case_id, [c.as_dict() for c in candidates[:5]])
+                evidence = candidates[0].verification if candidates else VerificationResult(message="No matching decision was found").as_dict()
+                if selected_url and not selected:
+                    requested = next((c for c in candidates if c.source_url == selected_url), None)
+                    evidence = (requested.verification if requested and requested.verification else
+                        VerificationResult(source_url=selected_url, message="Selected candidate could not be independently verified against the original identifiers").as_dict())
+                self.database.update_case(case_id, status="Needs review", error_code="MATCH_REVIEW_REQUIRED",
+                    error_message="Conflicting decisions require corrected identifiers" if candidates_are_ambiguous(candidates) else evidence.get("message", "Insufficient identity evidence"),
+                    verification=evidence, manual_search_url=google_search_url(item.get("raw_text") or item["title"]))
                 return
-            if candidates[0].score == 0:
-                candidates[0].score = 100
-                candidates[0].verified = True
-                candidates[0].reasons = ["Both case sides matched"]
-            if candidates_are_ambiguous(candidates) or not candidate_is_high_confidence(
-                candidates[0]
-            ):
-                self.database.set_case_candidates(
-                    case_id, [candidate.as_dict() for candidate in candidates[:5]]
-                )
-                self.database.update_case(
-                    case_id,
-                    status="Needs review",
-                    error_code="MATCH_REVIEW_REQUIRED",
-                    error_message="Choose a match, or open Google if none is correct",
-                    manual_search_url=google_search_url(
-                        item.get("raw_text") or item["title"]
-                    ),
-                )
-                return
-            candidate = candidates[0]
-            selected_candidate = candidate
-            self.database.update_case(case_id, status="Verifying match")
-            item["docket"] = item.get("docket") or candidate.docket
-            item["decision_date"] = item.get("decision_date") or candidate.decision_date
-            item["reporter_citation"] = (
-                item.get("reporter_citation") or candidate.reporter_citation
-            )
-            item["metadata_source"] = candidate.source
-            item["metadata_source_url"] = candidate.source_url
-            if len(candidates) > 1:
-                item["warnings"] = list(item.get("warnings", [])) + [
-                    f"Title search returned {len(candidates)} matches; the closest result was used"
-                ]
-            if not item["docket"] or not item["decision_date"]:
-                self.database.update_case(
-                    case_id,
-                    status="Not saved",
-                    error_code="INCOMPLETE_MATCH",
-                    error_message="The matching decision did not include enough download details",
-                )
-                return
-            self.database.update_case(
-                case_id,
-                docket=item["docket"],
-                decision_date=item["decision_date"],
-                reporter_citation=item["reporter_citation"],
-                metadata_source=item["metadata_source"],
-                metadata_source_url=item["metadata_source_url"],
-                manual_search_url="",
-                warnings=item.get("warnings", []),
-            )
+            item.update(docket=selected.docket, decision_date=selected.decision_date,
+                reporter_citation=selected.reporter_citation, metadata_source=selected.source,
+                metadata_source_url=selected.source_url)
+            self.database.update_case(case_id, docket=selected.docket, decision_date=selected.decision_date,
+                reporter_citation=selected.reporter_citation, metadata_source=selected.source,
+                metadata_source_url=selected.source_url, verification=selected.verification)
             self.database.clear_case_candidates(case_id)
+        else:
+            item["docket"], item["decision_date"] = lookup.docket, lookup.decision_date
         week_dir = output_dir / safe_week_folder(item["week"])
+        part_path = None
+        final_path = week_dir / item["filename"]
         try:
             week_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self.database.update_case(
-                case_id,
-                status="Not saved",
-                error_code="FOLDER_CREATE_FAILED",
-                error_message=str(exc),
-            )
-            return
-        final_path = week_dir / item["filename"]
-        if path_too_long(final_path):
-            self.database.update_case(
-                case_id,
-                status="Not saved",
-                error_code="PATH_TOO_LONG",
-                error_message="The destination path is too long for reliable cross-platform use",
-            )
-            return
-        if final_path.exists():
-            validation = validate_pdf(final_path, item["docket"], item["decision_date"])
-            if validation.valid:
-                self.database.update_case(
-                    case_id,
-                    status="Already saved",
-                    saved_path=str(final_path),
-                    warnings=list(item.get("warnings", [])) + validation.warnings,
-                )
-            else:
-                self.database.update_case(
-                    case_id,
-                    status="Not saved",
-                    saved_path=str(final_path),
-                    error_code="EXISTING_FILE_INVALID",
-                    error_message=(
-                        "An existing title-named file was preserved but is invalid: "
-                        f"{validation.error_message}"
-                    ),
-                )
-            return
-
-        part_path = week_dir / f".{item['filename']}.{uuid.uuid4().hex}.part"
-        parsed = ParsedCase(
-            ordinal=item["ordinal"],
-            week=item["week"],
-            title=item["title"],
-            docket=item["docket"],
-            decision_date=item["decision_date"],
-            raw_text=item["raw_text"],
-            warnings=list(item.get("warnings", [])),
-            reporter_citation=item.get("reporter_citation", ""),
-            metadata_source=item.get("metadata_source", ""),
-            metadata_source_url=item.get("metadata_source_url", ""),
-        )
-
-        async def update_status(status: str) -> None:
-            self.database.update_case(case_id, status=status)
-
-        try:
+            if path_too_long(final_path):
+                self.database.update_case(case_id, status="Not saved", error_code="PATH_TOO_LONG", error_message="Destination path is too long")
+                return
+            def validate(path, url=""):
+                return validate_pdf(path, item["docket"], item["decision_date"], lookup.title, url)
+            def evidence_for(validation):
+                evidence = validation.verification.as_dict()
+                if selected:
+                    evidence["identity_verification"] = selected.verification
+                    evidence["evidence"] = selected.verification.get("evidence", []) + evidence["evidence"]
+                return evidence
+            if final_path.exists():
+                validation = validate(final_path, item.get("source_url", ""))
+                self.database.update_case(case_id, status="Already saved" if validation.valid else "Not saved",
+                    saved_path=str(final_path), verification=evidence_for(validation),
+                    error_code="" if validation.valid else "EXISTING_FILE_INVALID",
+                    error_message="" if validation.valid else f"Existing file preserved: {validation.error_message}")
+                return
+            part_path = week_dir / f".{item['filename']}.{uuid.uuid4().hex}.part"
+            parsed = ParsedCase(item["ordinal"], item["week"], lookup.title, item["docket"],
+                item["decision_date"], item.get("raw_text", ""),
+                metadata_source=item.get("metadata_source", ""), metadata_source_url=item.get("metadata_source_url", ""))
+            async def update_status(status):
+                self.database.update_case(case_id, status=status)
             result = await retriever.retrieve(parsed, part_path, update_status)
             await self._record_attempts(run_id, case_id, result)
-            if not result.success and not item.get("metadata_source_url"):
-                # A complete docket/date can still miss brittle source indexes.
-                # Only then broaden the lookup through Google, like a manual retry.
+            if not result.success and not needs_resolution:
+                self.database.update_case(case_id, status="Searching case details")
                 try:
-                    self.database.update_case(case_id, status="Searching Google")
-                    page_fetcher = getattr(retriever, "fetch_text", None)
-                    try:
-                        fallback_candidates = await resolver.candidates(parsed, page_fetcher)
-                    except TypeError:
-                        fallback_candidates = await resolver.candidates(parsed)
+                    candidates = await resolver.candidates(lookup, getattr(retriever, "fetch_text", None))
                 except GoogleSearchBlocked as exc:
-                    if exc.candidates:
-                        self.database.set_case_candidates(
-                            case_id,
-                            [candidate.as_dict() for candidate in exc.candidates[:5]],
-                        )
-                    self.database.update_case(
-                        case_id,
-                        status="Needs review",
-                        error_code="GOOGLE_SEARCH_BLOCKED",
-                        error_message=str(exc),
-                        manual_search_url=exc.manual_search_url,
-                    )
-                    return
-                except WebSearchError:
-                    self.database.update_case(
-                        case_id,
-                        status="Needs review",
-                        error_code="GOOGLE_SEARCH_FAILED",
-                        error_message=(
-                            "Google search could not be completed. "
-                            "Retry later or search manually."
-                        ),
-                        manual_search_url=google_search_url(
-                            item.get("raw_text") or item["title"]
-                        ),
-                    )
-                    return
-                except Exception:
-                    fallback_candidates = []
-
-                if fallback_candidates:
-                    if fallback_candidates[0].score == 0:
-                        fallback_candidates[0].score = 100
-                        fallback_candidates[0].verified = True
-                        fallback_candidates[0].reasons = ["Both case sides matched"]
-                    if candidates_are_ambiguous(
-                        fallback_candidates
-                    ) or not candidate_is_high_confidence(fallback_candidates[0]):
-                        self.database.set_case_candidates(
-                            case_id,
-                            [candidate.as_dict() for candidate in fallback_candidates[:5]],
-                        )
-                        self.database.update_case(
-                            case_id,
-                            status="Needs review",
-                            error_code="MATCH_REVIEW_REQUIRED",
-                            error_message="Choose a match, or open Google if none is correct",
-                            manual_search_url=google_search_url(
-                                item.get("raw_text") or item["title"]
-                            ),
-                        )
+                    candidates = exc.candidates
+                    if not any(candidate_is_high_confidence(c) for c in candidates):
+                        self.database.set_case_candidates(case_id, [c.as_dict() for c in candidates[:5]])
+                        self.database.update_case(case_id, status="Needs review", error_code="GOOGLE_SEARCH_BLOCKED",
+                            error_message=str(exc), manual_search_url=exc.manual_search_url,
+                            verification=candidates[0].verification if candidates else VerificationResult().as_dict())
                         return
-                    fallback_candidate = fallback_candidates[0]
-                    selected_candidate = fallback_candidate
-                    item["metadata_source"] = fallback_candidate.source
-                    item["metadata_source_url"] = fallback_candidate.source_url
-                    self.database.update_case(
-                        case_id,
-                        status="Verifying match",
-                        metadata_source=fallback_candidate.source,
-                        metadata_source_url=fallback_candidate.source_url,
-                        manual_search_url="",
-                    )
-                    retry_case = ParsedCase(
-                        ordinal=parsed.ordinal,
-                        week=parsed.week,
-                        title=parsed.title,
-                        docket=parsed.docket,
-                        decision_date=parsed.decision_date,
-                        raw_text=parsed.raw_text,
-                        warnings=parsed.warnings,
-                        reporter_citation=parsed.reporter_citation,
-                        metadata_source=fallback_candidate.source,
-                        metadata_source_url=fallback_candidate.source_url,
-                    )
-                    result = await retriever.retrieve(retry_case, part_path, update_status)
+                selected = next((c for c in candidates if candidate_is_high_confidence(c)), None)
+                if selected and not candidates_are_ambiguous(candidates):
+                    parsed.metadata_source_url = selected.source_url
+                    parsed.metadata_source = selected.source
+                    self.database.update_case(case_id, metadata_source=selected.source, metadata_source_url=selected.source_url)
+                    result = await retriever.retrieve(parsed, part_path, update_status)
                     await self._record_attempts(run_id, case_id, result)
-            warnings = list(item.get("warnings", [])) + result.warnings
+                elif candidates:
+                    self.database.set_case_candidates(case_id, [c.as_dict() for c in candidates[:5]])
+                    self.database.update_case(case_id, status="Needs review", error_code="MATCH_REVIEW_REQUIRED",
+                        error_message="No conclusive source identity match", verification=candidates[0].verification)
+                    return
             if not result.success:
-                self.database.update_case(
-                    case_id,
-                    status="Not saved",
-                    error_code=result.error_code,
-                    error_message=result.error_message,
-                    warnings=warnings,
-                )
+                self.database.update_case(case_id, status="Not saved", error_code=result.error_code,
+                    error_message=result.error_message, warnings=result.warnings,
+                    verification=result.verification or VerificationResult(message=result.error_message).as_dict())
+                return
+            validation = validate(part_path, result.source_url)
+            if not validation.valid:
+                self.database.update_case(case_id, status="Needs review", error_code=validation.error_code,
+                    error_message=validation.error_message, verification=validation.verification.as_dict())
                 return
             self.database.update_case(case_id, status="Saving")
-            os.replace(part_path, final_path)
-            validation = validate_pdf(final_path, item["docket"], item["decision_date"])
-            if not validation.valid:
-                # Do not delete a final file silently. This condition should be impossible
-                # because the part file was validated, so surface it for manual inspection.
-                self.database.update_case(
-                    case_id,
-                    status="Not saved",
-                    saved_path=str(final_path),
-                    source=result.source,
-                    source_url=result.source_url,
-                    error_code="POST_SAVE_VALIDATION_FAILED",
-                    error_message=validation.error_message,
-                    warnings=warnings,
-                )
-                return
-            self.database.update_case(
-                case_id,
-                status="Saved",
-                saved_path=str(final_path),
-                source=result.source,
-                source_url=result.source_url,
-                warnings=warnings + validation.warnings,
-            )
-            cache_candidate = selected_candidate or CaseCandidate(
-                title=item["title"],
-                docket=item.get("docket", ""),
-                decision_date=item.get("decision_date", ""),
-                reporter_citation=item.get("reporter_citation", ""),
-                source=result.source,
-                source_url=result.source_url,
-                score=100,
-                reasons=["Successfully downloaded and verified"],
-                verified=True,
-            )
-            cache_verified = getattr(resolver, "cache_verified", None)
-            if cache_verified:
-                cache_verified(parsed, cache_candidate)
-        except PermissionError as exc:
-            self.database.update_case(
-                case_id,
-                status="Not saved",
-                error_code="FILE_PERMISSION_ERROR",
-                error_message=str(exc),
-            )
+            # Publish atomically without replacing an existing destination,
+            # including files created by another run after the initial check.
+            if os.name == "nt":
+                os.rename(part_path, final_path)
+            else:
+                os.link(part_path, final_path)
+            evidence = evidence_for(validation)
+            self.database.update_case(case_id, status="Saved", saved_path=str(final_path),
+                source=result.source, source_url=result.source_url, warnings=result.warnings,
+                verification=evidence, error_code="", error_message="", manual_search_url="")
+            if selected:
+                cache_verified = getattr(resolver, "cache_verified", None)
+                if cache_verified:
+                    try:
+                        cache_verified(lookup, selected)
+                    except Exception as exc:
+                        self.database.update_case(case_id, warnings=result.warnings + [f"Verified mapping cache could not be updated: {exc}"])
         except OSError as exc:
-            code = "DISK_FULL" if getattr(exc, "errno", None) == 28 else "FILE_WRITE_ERROR"
-            self.database.update_case(
-                case_id, status="Not saved", error_code=code, error_message=str(exc)
-            )
+            self.database.update_case(case_id, status="Not saved", error_code="FILE_WRITE_ERROR", error_message=str(exc))
         except Exception as exc:
-            self.database.update_case(
-                case_id,
-                status="Not saved",
-                error_code="UNEXPECTED_ERROR",
-                error_message=str(exc),
-            )
+            self.database.update_case(case_id, status="Not saved", error_code="UNEXPECTED_ERROR", error_message=str(exc))
         finally:
-            part_path.unlink(missing_ok=True)
+            if part_path:
+                part_path.unlink(missing_ok=True)
 
     async def _process(
         self, run_id: str, cancel_event: asyncio.Event, retry_only: bool
@@ -577,9 +391,10 @@ class JobManager:
                         "Searching web",
                         "Searching Google",
                         "Verifying match",
+                        "Searching ChanRobles",
                         "Searching Lawphil",
                         "Searching E-Library",
-                        "Searching ChanRobles",
+                        "Searching Supreme Court",
                         "Saving",
                     ):
                         self.database.update_case(

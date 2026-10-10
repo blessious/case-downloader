@@ -29,6 +29,7 @@ class CaseRequest(BaseModel):
     metadata_source: str = ""
     metadata_source_url: str = ""
     resolution_status: str = "ready"
+    original_input: dict[str, str] = Field(default_factory=dict)
 
 
 class ResolveCasesRequest(BaseModel):

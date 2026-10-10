@@ -11,7 +11,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import Browser, Page, Playwright, async_playwright
 from pypdf import PdfReader
 
 from .config import MAX_ATTEMPTS, REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS
@@ -19,6 +19,8 @@ from .domain import ParsedCase, RetrievalAttempt, RetrievalResult
 from .network import trusted_ssl_context
 from .parser import DATE_RE, docket_tokens
 from .pdf_utils import validate_pdf
+from .verification import heading_identity, verify_identity
+from email.utils import parsedate_to_datetime
 
 
 StatusCallback = Callable[[str], Awaitable[None]]
@@ -37,12 +39,12 @@ MONTH_CODES = {
     11: "nov",
     12: "dec",
 }
+
+CHANROBLES_CONTENT_SELECTOR = ".mainContent > .content"
 ALLOWED_HOSTS = {
     "lawphil.net",
     "www.lawphil.net",
     "elibrary.judiciary.gov.ph",
-    "sc.judiciary.gov.ph",
-    "www.sc.judiciary.gov.ph",
     "chanrobles.com",
     "www.chanrobles.com",
 }
@@ -161,6 +163,7 @@ class CaseRetriever:
             try:
                 await asyncio.sleep(REQUEST_DELAY_SECONDS)
                 response = await self.client.request(method, url, data=data)
+                _assert_allowed(str(response.url))
                 content_type = response.headers.get("content-type", "")
                 preview = ""
                 if "text" in content_type or "html" in content_type:
@@ -203,10 +206,17 @@ class CaseRetriever:
                         utc_now(),
                     )
                 )
-                if response.status_code in (401, 403, 404) or attempt_no == MAX_ATTEMPTS:
+                if (response.status_code != 429 and response.status_code < 500) or attempt_no == MAX_ATTEMPTS:
                     response.raise_for_status()
-                delay = float(response.headers.get("Retry-After", 0) or 0)
-                await asyncio.sleep(max(delay, (2**attempt_no) + random.random()))
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    try:
+                        delay = (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
+                    except (ValueError, TypeError):
+                        delay = (2 if attempt_no == 1 else 5) + random.random()
+                await asyncio.sleep(min(60, max(0, delay)))
             except PermissionError:
                 raise
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -225,7 +235,7 @@ class CaseRetriever:
                     )
                 )
                 if attempt_no < MAX_ATTEMPTS:
-                    await asyncio.sleep((2**attempt_no) + random.random())
+                    await asyncio.sleep((2 if attempt_no == 1 else 5) + random.random())
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 break
@@ -333,6 +343,74 @@ class CaseRetriever:
         except (PermissionError, httpx.HTTPStatusError, httpx.TransportError):
             return await self._browser_html(source, url)
 
+    async def _prepare_page_for_pdf(self, page: Page, source: str) -> None:
+        """Remove site chrome and make the decision itself fill the print page."""
+        content_selector = (
+            CHANROBLES_CONTENT_SELECTOR if source == "ChanRobles" else None
+        )
+        content_found = await page.evaluate(
+            """
+            (contentSelector) => {
+                for (const selector of [
+                    '#cookie_box',
+                    '.cookie_box',
+                    '[class*="cookie-consent"]',
+                    '[id*="cookie-consent"]'
+                ]) {
+                    document.querySelectorAll(selector).forEach((node) => node.remove());
+                }
+
+                if (!contentSelector) return true;
+
+                const content = document.querySelector(contentSelector);
+                if (!content) return false;
+
+                // Move the existing node instead of copying its HTML so the page's
+                // typography and inline case formatting remain intact.
+                document.body.replaceChildren(content);
+                document.documentElement.removeAttribute('class');
+                document.body.removeAttribute('class');
+
+                const printStyle = document.createElement('style');
+                printStyle.textContent = `
+                    html, body {
+                        margin: 0 !important;
+                        padding: 0 !important;
+                        width: auto !important;
+                        min-width: 0 !important;
+                        background: white !important;
+                    }
+                    body > .content {
+                        display: block !important;
+                        float: none !important;
+                        position: static !important;
+                        inset: auto !important;
+                        width: 100% !important;
+                        max-width: none !important;
+                        min-width: 0 !important;
+                        height: auto !important;
+                        margin: 0 !important;
+                        padding: 0 !important;
+                        border: 0 !important;
+                        box-shadow: none !important;
+                        background: white !important;
+                    }
+                    body > .content img,
+                    body > .content table {
+                        max-width: 100% !important;
+                    }
+                `;
+                document.head.appendChild(printStyle);
+                return true;
+            }
+            """,
+            content_selector,
+        )
+        if content_selector and not content_found:
+            raise RuntimeError(
+                "ChanRobles decision content was not found; refusing to print the full webpage"
+            )
+
     async def _render_pdf(self, source: str, url: str, output_path: Path) -> None:
         _assert_allowed(url)
         started = utc_now()
@@ -359,22 +437,7 @@ class CaseRetriever:
                 content = await page.content()
                 if _looks_blocked(content):
                     raise PermissionError("Website presented a CAPTCHA, login, or access-block page")
-                # Lawphil writes its cookie notice into the DOM. The cookie prevents it
-                # on normal visits; removing the node is a second safeguard for printing.
-                await page.evaluate(
-                    """
-                    () => {
-                        for (const selector of [
-                            '#cookie_box',
-                            '.cookie_box',
-                            '[class*="cookie-consent"]',
-                            '[id*="cookie-consent"]'
-                        ]) {
-                            document.querySelectorAll(selector).forEach((node) => node.remove());
-                        }
-                    }
-                    """
-                )
+                await self._prepare_page_for_pdf(page, source)
                 await page.emulate_media(media="print")
                 await page.pdf(
                     path=str(output_path),
@@ -424,6 +487,10 @@ class CaseRetriever:
         page_html: str,
         output_path: Path,
     ) -> tuple[bool, str, list[str]]:
+        identity = verify_identity(case, heading_identity(page_html), page_url)
+        self.verification = identity.as_dict()
+        if not identity.verified:
+            return False, page_url, [identity.message]
         soup = BeautifulSoup(page_html, "html.parser")
         pdf_urls: list[str] = []
         for anchor in soup.find_all("a", href=True):
@@ -438,7 +505,8 @@ class CaseRetriever:
             try:
                 response = await self._request(source, "GET", pdf_url)
                 output_path.write_bytes(response.content)
-                validation = validate_pdf(output_path, case.docket, case.decision_date)
+                validation = validate_pdf(output_path, case.docket, case.decision_date, case.title)
+                self.verification = validation.verification.as_dict()
                 if validation.valid:
                     warnings.extend(validation.warnings)
                     return True, pdf_url, warnings
@@ -450,7 +518,8 @@ class CaseRetriever:
 
         try:
             await self._render_pdf(source, page_url, output_path)
-            validation = validate_pdf(output_path, case.docket, case.decision_date)
+            validation = validate_pdf(output_path, case.docket, case.decision_date, case.title)
+            self.verification = validation.verification.as_dict()
             if validation.valid:
                 warnings.extend(validation.warnings)
                 return True, page_url, warnings
@@ -561,7 +630,8 @@ class CaseRetriever:
             try:
                 response = await self._request(source, "GET", page_url)
                 output_path.write_bytes(response.content)
-                validation = validate_pdf(output_path, case.docket, case.decision_date)
+                validation = validate_pdf(output_path, case.docket, case.decision_date, case.title)
+                self.verification = validation.verification.as_dict()
                 if validation.valid:
                     return True, str(response.url), validation.warnings, "", ""
                 output_path.unlink(missing_ok=True)
@@ -761,51 +831,25 @@ class CaseRetriever:
         status_callback: StatusCallback,
     ) -> RetrievalResult:
         self.attempts = []
-        await status_callback("Searching Lawphil")
+        self.verification = {}
         direct_url = case.metadata_source_url
         direct_host = urlparse(direct_url).hostname if direct_url else ""
         direct_source = {
             "lawphil.net": "Lawphil",
             "www.lawphil.net": "Lawphil",
             "elibrary.judiciary.gov.ph": "Supreme Court E-Library",
-            "sc.judiciary.gov.ph": "Supreme Court",
-            "www.sc.judiciary.gov.ph": "Supreme Court",
             "chanrobles.com": "ChanRobles",
             "www.chanrobles.com": "ChanRobles",
         }.get(direct_host or "")
-        lawphil = (
-            await self._lawphil_direct(case, output_path, direct_url)
-            if direct_source == "Lawphil"
-            else (
-                await self._trusted_direct(case, output_path, direct_source, direct_url)
-                if direct_source
-                else await self._lawphil(case, output_path)
-            )
-        )
-        if lawphil[0]:
-            return RetrievalResult(
-                True,
-                direct_source or "Lawphil",
-                lawphil[1],
-                str(output_path),
-                attempts=list(self.attempts),
-                warnings=lawphil[2],
-            )
-        output_path.unlink(missing_ok=True)
-        await status_callback("Searching E-Library")
-        elibrary = await self._elibrary(case, output_path)
-        if elibrary[0]:
-            return RetrievalResult(
-                True,
-                "Supreme Court E-Library",
-                elibrary[1],
-                str(output_path),
-                attempts=list(self.attempts),
-                warnings=lawphil[2] + elibrary[2],
-            )
-        output_path.unlink(missing_ok=True)
+
+        # Keep the source order predictable for every case. A verified direct
+        # URL is still used when its source's turn arrives in the sequence.
         await status_callback("Searching ChanRobles")
-        chanrobles = await self._chanrobles(case, output_path)
+        chanrobles = (
+            await self._trusted_direct(case, output_path, "ChanRobles", direct_url)
+            if direct_source == "ChanRobles"
+            else await self._chanrobles(case, output_path)
+        )
         if chanrobles[0]:
             return RetrievalResult(
                 True,
@@ -813,10 +857,52 @@ class CaseRetriever:
                 chanrobles[1],
                 str(output_path),
                 attempts=list(self.attempts),
-                warnings=lawphil[2] + elibrary[2] + chanrobles[2],
+                warnings=chanrobles[2],
             )
         output_path.unlink(missing_ok=True)
-        error_code = chanrobles[3] or elibrary[3] or lawphil[3] or "NOT_FOUND"
+
+        await status_callback("Searching Lawphil")
+        lawphil = (
+            await self._lawphil_direct(case, output_path, direct_url)
+            if direct_source == "Lawphil"
+            else await self._lawphil(case, output_path)
+        )
+        if lawphil[0]:
+            return RetrievalResult(
+                True,
+                "Lawphil",
+                lawphil[1],
+                str(output_path),
+                attempts=list(self.attempts),
+                warnings=chanrobles[2] + lawphil[2],
+            )
+        output_path.unlink(missing_ok=True)
+
+        await status_callback("Searching E-Library")
+        elibrary = (
+            await self._trusted_direct(
+                case, output_path, "Supreme Court E-Library", direct_url
+            )
+            if direct_source == "Supreme Court E-Library"
+            else await self._elibrary(case, output_path)
+        )
+        if elibrary[0]:
+            return RetrievalResult(
+                True,
+                "Supreme Court E-Library",
+                elibrary[1],
+                str(output_path),
+                attempts=list(self.attempts),
+                warnings=chanrobles[2] + lawphil[2] + elibrary[2],
+            )
+        output_path.unlink(missing_ok=True)
+
+        error_code = (
+            chanrobles[3]
+            or lawphil[3]
+            or elibrary[3]
+            or "NOT_FOUND"
+        )
         source_codes = {lawphil[3], elibrary[3], chanrobles[3]}
         if source_codes.issubset({"", "NOT_FOUND", "CASE_NOT_FOUND"}):
             error_message = "No matching decision was found on the approved legal sources."
@@ -829,5 +915,6 @@ class CaseRetriever:
             error_code=error_code,
             error_message=error_message,
             attempts=list(self.attempts),
-            warnings=lawphil[2] + elibrary[2] + chanrobles[2],
+            warnings=chanrobles[2] + lawphil[2] + elibrary[2],
+            verification=self.verification,
         )

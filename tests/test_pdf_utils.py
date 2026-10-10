@@ -14,13 +14,13 @@ def write_blank_pdf(path: Path) -> None:
         writer.write(handle)
 
 
-def test_valid_pdf_with_unextractable_identity_is_accepted_with_warning(tmp_path: Path) -> None:
+def test_pdf_with_unextractable_identity_requires_review(tmp_path: Path) -> None:
     path = tmp_path / "case.pdf"
     write_blank_pdf(path)
     result = validate_pdf(path, "G.R. No. 145561", "2005-06-15")
-    assert result.valid
+    assert not result.valid
     assert result.page_count == 1
-    assert result.warnings
+    assert result.error_code == "PDF_IDENTITY_UNVERIFIED"
 
 
 def test_html_masquerading_as_pdf_is_rejected(tmp_path: Path) -> None:
